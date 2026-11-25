@@ -1718,7 +1718,7 @@ impl Host {
                         let b = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
-                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_COMMON,
                         )?;
                         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
                             Format: format,
