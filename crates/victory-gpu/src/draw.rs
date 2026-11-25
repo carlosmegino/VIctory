@@ -2026,7 +2026,7 @@ const QUADS: u32 = 19;
 const QUAD_STRIP: u32 = 20;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A root signature that indexes the heaps directly needs one of each
@@ -2143,6 +2143,60 @@ void main() {
         let title_heap = crate::descriptor::heap(heap);
         let heap_host = title_heap.host().expect("a host view heap");
         (heap, title_heap, heap_host)
+    }
+
+    /// Use the title's table and tracked memory, then execute the runtime's
+    /// normal bind, dispatch and write-mark copy-back path.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn dispatch_wave64_and_read_back(pipeline: This, threads: u32, expected: &[u32]) {
+        const UAVS: usize = 7;
+        const PADDING: usize = 8;
+        const CANARY: u32 = 0xA15C_F00D;
+        const STRIDE: usize = 1024;
+        let host = crate::host::host().expect("runtime device");
+        let memory = crate::watch::tests::pool(2);
+        let words = [1, 0, 0, 0, 2 << 16, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 4, 0];
+        let buffer = texture_at_address(memory as u64, &words);
+        let (heap, title_heap, _) = view_heap(8);
+        let lanes = threads as usize;
+        assert_eq!(expected.len(), UAVS * lanes);
+        for slot in 0..UAVS {
+            // SAFETY: each view and its padding lie in a distinct part of
+            // the allocated title buffer.
+            for lane in 0..lanes + PADDING {
+                unsafe { ((memory + slot * STRIDE + lane * 4) as *mut u32).write(CANARY) };
+            }
+            let raw = [
+                39, 1, (slot * STRIDE / 4) as u32, 0, (lanes + PADDING) as u32, 0, 0, 0, 1, 0,
+            ];
+            crate::descriptor::create_uav(
+                std::ptr::null(), buffer, std::ptr::null(), &raw, title_heap.start + slot as u64 * 32,
+            );
+        }
+        let list = host.new_list().expect("runtime command list");
+        let mut state = State::default();
+        state.set_pipeline(pipeline);
+        state.set_heaps(&[heap]);
+        state.set_table(true, 0, title_heap.start);
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        // SAFETY: the runtime has finished writing the tracked allocation.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+        for slot in 0..UAVS {
+            // SAFETY: each slice lies in the still-live title buffer.
+            let got = unsafe {
+                std::slice::from_raw_parts((memory + slot * STRIDE) as *const u32, lanes + PADDING)
+            };
+            for lane in 0..lanes {
+                assert_eq!(got[lane], expected[lane * UAVS + slot], "runtime UAV {slot}, lane {lane}");
+            }
+            assert_eq!(&got[lanes..], &[CANARY; PADDING], "runtime UAV {slot} guard");
+        }
+        type Release = extern "system" fn(This) -> u32;
+        let _ = crate::object::slot::<Release>(heap, 0x10)(heap);
+        let _ = crate::object::slot::<Release>(buffer, 0x10)(buffer);
+        eprintln!("runtime dispatch: {threads} guest lanes, seven UAVs and canaries verified");
     }
 
     fn dispatch_marked_uav(
