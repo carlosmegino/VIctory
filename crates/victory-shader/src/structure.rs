@@ -472,6 +472,10 @@ pub struct Structured {
     /// A pixel's discards, by block and instruction: the lanes (EXEC there)
     /// the instruction takes out of the live mask, which here stay in it.
     pub discards: HashMap<(usize, usize), Bool>,
+    /// A paired compute branch tests either any or every logical lane.
+    pub(crate) wave_branches: Vec<Option<bool>>,
+    /// A mask result's SCC is set if some logical lane is set.
+    pub(crate) wave_scc: HashMap<Value, Bool>,
 }
 
 impl Structured {
@@ -486,7 +490,7 @@ impl Structured {
 
 /// Builds the per-lane form of `program`.
 pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, true)
+    structure_as(program, true, false)
 }
 
 /// The per-lane form with a pixel's discarded lanes taken out of the live
@@ -494,11 +498,22 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// what a program needs whose discarded lanes would read values no
 /// surviving lane does (see [`Structured::discards`]).
 pub fn killing(program: &Program) -> Result<Structured, ShaderError> {
-    structure_as(program, false)
+    structure_as(program, false, false)
 }
 
-fn structure_as(program: &Program, helpers: bool) -> Result<Structured, ShaderError> {
+/// In a paired compute wave, a lane follows its wave's branch. Its
+/// own EXEC remains a guard on the instructions the branch reaches.
+/// Adapted from `structure_wide` in victory-fork #854's baseline.
+pub(crate) fn paired_compute(program: &Program) -> Result<Structured, ShaderError> {
+    structure_as(program, false, true)
+}
+
+fn structure_as(program: &Program, helpers: bool, paired: bool) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
+    l.paired = paired;
+    if paired {
+        l.wave_branches.resize(program.blocks.len(), None);
+    }
     if !helpers {
         l.kills.clear();
     }
@@ -545,6 +560,8 @@ struct Lanes<'a> {
     first: Vec<Bool>,
     /// Per block ending in a branch: when a lane takes it.
     when: Vec<Option<Bool>>,
+    paired: bool,
+    wave_branches: Vec<Option<bool>>,
     /// See [`Structured::active`].
     active: HashSet<Value>,
     /// See [`Structured::restored`].
@@ -614,6 +631,8 @@ impl<'a> Lanes<'a> {
             joins: Vec::new(),
             first: vec![Bool::FALSE; blocks.len()],
             when: vec![None; blocks.len()],
+            paired: false,
+            wave_branches: Vec::new(),
             active: HashSet::new(),
             restored: Map::default(),
             kills: HashSet::new(),
@@ -692,6 +711,7 @@ impl<'a> Lanes<'a> {
         self.joins.clear();
         self.first.fill(Bool::FALSE);
         self.when.fill(None);
+        self.wave_branches.fill(None);
         self.active.clear();
     }
 
@@ -776,6 +796,18 @@ impl<'a> Lanes<'a> {
                     }
                 }
                 self.when[b] = Some(w);
+                if self.paired {
+                    let mask_scc = last
+                        .read(Reg::Scc)
+                        .is_some_and(|v| self.scc_lane.contains_key(&v));
+                    self.wave_branches[b] = match last.name() {
+                        "s_cbranch_execnz" | "s_cbranch_vccnz" => Some(true),
+                        "s_cbranch_execz" | "s_cbranch_vccz" => Some(false),
+                        "s_cbranch_scc1" if mask_scc => Some(true),
+                        "s_cbranch_scc0" if mask_scc => Some(false),
+                        _ => None,
+                    };
+                }
             }
         }
         execs
@@ -783,6 +815,9 @@ impl<'a> Lanes<'a> {
 
     /// `c` narrowed by the branch at the end of `q` towards one successor.
     fn edge(&mut self, c: Bool, q: usize, taken: bool) -> Bool {
+        if self.wave_branches.get(q).is_some_and(Option::is_some) {
+            return c;
+        }
         match self.when[q] {
             Some(w) if taken => self.b.and(c, w),
             Some(w) => {
@@ -892,6 +927,12 @@ impl<'a> Lanes<'a> {
             exits,
             guards,
             reach: cond.to_vec(),
+            wave_branches: self.wave_branches,
+            wave_scc: if self.paired {
+                self.scc_lane.into_iter().collect()
+            } else {
+                HashMap::new()
+            },
         })
     }
 

@@ -19,6 +19,21 @@ pub struct Host {
     warp: bool,
 }
 
+/// Host property used by the compiler and the persistent shader cache.
+pub fn wave32_only(device: &ID3D12Device) -> bool {
+    let mut caps = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+    // SAFETY: The feature query writes the matching description.
+    let ok = unsafe {
+        device.CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS1,
+            (&raw mut caps).cast(),
+            size_of_val(&caps) as u32,
+        )
+    };
+    ok.is_ok() && caps.WaveOps.as_bool() && (1..=32).contains(&caps.WaveLaneCountMin)
+        && caps.WaveLaneCountMax == 32
+}
+
 /// What the stage declares that a pipeline must match.
 fn sig(dxil: &[u8], fourcc: FourCC) -> Result<Vec<SigElement>, String> {
     let c = Container::parse(dxil).map_err(|e| e.to_string())?;

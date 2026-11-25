@@ -222,6 +222,8 @@ mod shader;
 mod stride_tests;
 #[cfg(all(test, windows))]
 mod synthetic_tests;
+#[cfg(all(test, windows))]
+mod wave64_group_tests;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -375,6 +377,9 @@ pub struct Options {
     /// "Write marks"); the host must then bind the view-mark table and the
     /// bitmap ([`HostShader::view_marks`]).
     pub view_marks: bool,
+    /// The target supports wave operations and its maximum wave size is 32.
+    /// Native translation remains the default for offline callers.
+    pub wave32_only: bool,
 }
 
 /// Translates the vertex, pixel, compute or mesh program of a console
@@ -500,7 +505,54 @@ pub fn emit_with(
         mesh_stride,
         view_marks: options.view_marks,
     };
-    let l = match lower::lower(&parts(st, res)) {
+    let paired_target = options.wave32_only && native.stage == HwStage::Cs && native.wave64;
+    // A masked first-lane read can elect across halves even when no
+    // instruction names another lane. Apply the correction from de64bd5
+    // before considering a translation that happens to accept wave32.
+    let force_paired = paired_target && p.blocks.iter().enumerate().any(|(b, block)| {
+        block.insts.iter().enumerate().any(|(i, inst)| {
+            inst.name() == "v_readfirstlane_b32"
+                && st.guards[b][i].is_some()
+                && !inst.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1))
+        })
+    });
+    let paired = || {
+        let crate::native::StageIo::Cs(cs) = native.io else { unreachable!("paired compute") };
+        let threads = cs.threads.into_iter().try_fold(1u32, u32::checked_mul).unwrap_or(0);
+        if threads == 0 || threads > 1024 || !threads.is_multiple_of(64)
+            || cs.lds_bytes() / 4 + u32::from(threads > 64) > 8192
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0, what: "paired compute needs whole waves and spare group memory",
+            });
+        }
+        if !res.waterfall.reads.is_empty()
+            || p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                matches!(&i.fields, crate::gfx10::Fields::Valu(v) if v.dpp.is_some())
+                    || i.name().starts_with("v_mbcnt")
+                    || i.name().starts_with("v_permlane")
+                    || i.name() == "v_writelane_b32"
+            })
+        {
+            return Err(ShaderError::Unsupported {
+                offset: 0, what: "a lane operation not yet supported by paired compute",
+            });
+        }
+        let paired_st = structure::paired_compute(p)?;
+        // Descriptor tracking stays based on the original per-lane paths.
+        lower::lower_paired(&lower::Parts { st: &paired_st, ..parts(st, res) })
+    };
+    let lowered = if force_paired {
+        paired()
+    } else {
+        let native = lower::lower(&parts(st, res));
+        match native {
+            Ok(l) if paired_target && l.wave_size == Some(64) => paired(),
+            Err(ShaderError::Unsupported { .. }) if paired_target => paired().or(native),
+            _ => native,
+        }
+    };
+    let l = match lowered {
         // Discarded lanes kept on as helpers can read what no surviving
         // lane does (a register only killed lanes skipped writing); such a
         // program kills them as the console does (`structure::killing`).

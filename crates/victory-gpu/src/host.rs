@@ -41,6 +41,7 @@ const RTV_RING: u32 = 1024;
 
 pub(crate) struct Host {
     pub(crate) device: ID3D12Device,
+    pub(crate) wave32_only: bool,
     pub(crate) depth_bounds_supported: bool,
     queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -195,6 +196,7 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
+        let wave32_only = victory_shader::emit::host::wave32_only(&device);
         let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS2::default();
         let depth_bounds_supported = device
             .CheckFeatureSupport(
@@ -249,6 +251,7 @@ fn create() -> windows::core::Result<Host> {
         }
         Ok(Host {
             device,
+            wave32_only,
             depth_bounds_supported,
             queue,
             fence,

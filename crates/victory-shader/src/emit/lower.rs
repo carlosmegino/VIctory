@@ -21,6 +21,7 @@ use crate::resource::{Address, CODE, MEMORY, Resources, Role, Site, Source, USER
 use crate::structure::{Atom, Bool, LaneExit, Structured};
 
 mod bvh;
+mod paired;
 
 type Why = &'static str;
 
@@ -33,6 +34,7 @@ enum Val {
 
 pub(crate) struct Lowered {
     pub dxil: Vec<u8>,
+    pub wave_size: Option<u32>,
     /// Bit n: immediate sampler n is a comparison sampler.
     pub cmp_samplers: u64,
     pub root_cbvs: Vec<u8>,
@@ -96,9 +98,19 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_mode(parts, false)
+}
+
+pub(crate) fn lower_paired(parts: &Parts) -> Result<Lowered, ShaderError> {
+    paired::check_control_flow(parts.p, parts.st)
+        .map_err(|what| ShaderError::Unsupported { offset: 0, what })?;
+    lower_with_mode(parts, true)
+}
+
+fn lower_with_mode(parts: &Parts, paired: bool) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, paired).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -284,6 +296,9 @@ struct Lower<'a> {
     /// the one in force at the instruction being lowered (see [`round16`]).
     round16: Vec<Option<u8>>,
     mode16: Option<u8>,
+    twin: Option<Box<paired::LaneState>>,
+    upper: bool,
+    wave_base: Option<V>,
 }
 
 /// The 16/64-bit round mode (MODE bits 3:2: 0 nearest even, 3 toward zero)
@@ -541,7 +556,7 @@ fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Addre
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, paired: bool) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -602,6 +617,13 @@ impl<'a> Lower<'a> {
             let one_wave = cs.threads.iter().product::<u32>() <= wave;
             if console_lanes || one_wave && s.lds_dwords > 0 {
                 s.wave_size = Some(wave);
+            }
+            if paired {
+                let groups = cs.threads.iter().product::<u32>() / 64;
+                s.threads = Some([groups * 32, 1, 1]);
+                s.lds_dwords += u32::from(groups > 1);
+                s.wave_size = Some(32);
+                console_lanes = true;
             }
         }
         let mut no_barrier = HashSet::new();
@@ -718,6 +740,9 @@ impl<'a> Lower<'a> {
                 })
                 .collect(),
             cur_ir: 0,
+            twin: paired.then(Box::default),
+            upper: false,
+            wave_base: None,
             sections: HashMap::new(),
             section_out: HashSet::new(),
             code_table: None,
@@ -1319,7 +1344,16 @@ impl<'a> Lower<'a> {
         }
         self.cur = self.s.entry;
         self.find_sections();
+        if self.twin.is_some() && !self.sections.is_empty() {
+            return Err(unsupported(0, "a whole-wave section in paired compute"));
+        }
         self.inputs()?;
+        if self.twin.is_some() {
+            self.swap_lanes();
+            let result = self.inputs();
+            self.swap_lanes();
+            result?;
+        }
         if let Some(mesh) = self.s.mesh {
             self.mesh_prologue(mesh).map_err(|w| unsupported(0, w))?;
             self.block[order[0]] = Some(self.cur);
@@ -1334,22 +1368,11 @@ impl<'a> Lower<'a> {
                 .filter(|&q| self.block[q].is_some())
                 .collect();
             self.exported[b] = !preds.is_empty() && preds.iter().all(|&q| self.exported_out(q));
-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
-                let val = match phi.reg {
-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
-                    Reg::Scc => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
-                        self.data_phis.push((v, b, i));
-                        Val::Bit(v)
-                    }
-                    _ => {
-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
-                        self.data_phis.push((v, b, i));
-                        Val::I32(v)
-                    }
-                };
-                self.vals.insert(phi.value, val);
+            self.block_phis(b);
+            if self.twin.is_some() {
+                self.swap_lanes();
+                self.block_phis(b);
+                self.swap_lanes();
             }
             let mut i = 0;
             self.mode16 = self.round16[b];
@@ -1358,13 +1381,14 @@ impl<'a> Lower<'a> {
                     // A pixel's discard: the lanes stay on as helpers.
                     let at = self.cur;
                     let offset = p.blocks[b].insts[i].machine.offset;
-                    let kill = self
-                        .boolean(lanes, at)
-                        .map_err(|w| unsupported(offset, w))?;
-                    self.s
-                        .op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+                    let kill = self.boolean(lanes, at).map_err(|w| unsupported(offset, w))?;
+                    self.s.op(at, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
                 }
-                self.inst(b, i)?;
+                if self.twin.is_some() {
+                    self.paired_inst(b, i)?;
+                } else {
+                    self.inst(b, i)?;
+                }
                 self.mode16 = round16_after(&p.blocks[b].insts[i], self.mode16);
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
@@ -1380,6 +1404,37 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        if self.twin.is_some() {
+            self.swap_lanes();
+            let result = self.fill_phis();
+            self.swap_lanes();
+            result?;
+            self.fill_phis()?;
+        }
+        self.finish()
+    }
+
+    fn block_phis(&mut self, b: usize) {
+        for (i, phi) in self.x.p.blocks[b].phis.iter().enumerate() {
+            let val = match phi.reg {
+                Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+                _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+                Reg::Scc => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i1);
+                    self.data_phis.push((v, b, i));
+                    Val::Bit(v)
+                }
+                _ => {
+                    let v = self.s.m.phi(self.cur, self.s.t.i32);
+                    self.data_phis.push((v, b, i));
+                    Val::I32(v)
+                }
+            };
+            self.vals.insert(phi.value, val);
+        }
+    }
+
+    fn finish(mut self) -> Result<Lowered, Stop> {
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -1390,6 +1445,7 @@ impl<'a> Lower<'a> {
         let view_addresses = self.s.view_addresses.is_some();
         let cmp_samplers = self.s.cmp_samplers;
         Ok(Lowered {
+            wave_size: self.s.wave_size,
             cmp_samplers,
             root_cbvs,
             root_srvs,
@@ -1833,16 +1889,28 @@ impl<'a> Lower<'a> {
                 if !self.balloting.insert(lo) {
                     return Err("a lane mask whose lanes depend on its own value");
                 }
-                let bit = self.boolean(m, at);
+                let paired = self.twin.is_some();
+                let bits = if paired {
+                    self.both(|l| l.boolean(m, at)).map(|[lo, hi]| (lo, Some(hi)))
+                } else {
+                    self.boolean(m, at).map(|lo| (lo, None))
+                };
                 self.balloting.remove(&lo);
-                let bit = bit?;
+                let (bit, hi) = bits?;
                 let i32t = self.s.t.i32;
                 let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
                 let r = self
                     .s
                     .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
                 self.s.flags |= flags::WAVE_OPS;
-                let xy = (self.s.m.extract(at, r, 0), self.s.m.extract(at, r, 1));
+                let high = match hi {
+                    None => self.s.m.extract(at, r, 1),
+                    Some(bit) => {
+                        let r = self.s.op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[bit]);
+                        self.s.m.extract(at, r, 0)
+                    }
+                };
+                let xy = (self.s.m.extract(at, r, 0), high);
                 self.ballots.insert(lo, xy);
                 xy
             }
@@ -2644,14 +2712,11 @@ impl<'a> Lower<'a> {
     /// This lane's bit of the mask `lo`, `hi` (wave64).
     fn lane_bit(&mut self, at: usize, lo: V, hi: Option<V>) -> V {
         self.s.flags |= flags::WAVE_OPS;
-        let lane = self.s.op(
-            at,
-            "waveGetLaneIndex",
-            Attr::ReadOnly,
-            self.s.t.i32,
-            111,
-            &[],
-        );
+        let lane = if self.twin.is_some() {
+            self.paired_lane(at)
+        } else {
+            self.s.op(at, "waveGetLaneIndex", Attr::ReadOnly, self.s.t.i32, 111, &[])
+        };
         let (k31, k32, one, z) = (
             self.s.m.i32(31),
             self.s.m.i32(32),
@@ -2912,6 +2977,9 @@ impl<'a> Lower<'a> {
     /// plus the lane index. (A bijection while each host wave holds a
     /// wave-aligned run of flat ids, as the console's waves do.)
     fn thread_id(&mut self, c: u8) -> Val {
+        if self.twin.is_some() {
+            return self.paired_thread(c);
+        }
         if !self.console_lanes {
             return self.compute_id("threadIdInGroup.i32", 95, c);
         }
@@ -3277,7 +3345,8 @@ impl<'a> Lower<'a> {
             self.write(inst, Reg::V(reg), r, guard);
             return Ok(());
         }
-        if self.s.lds_dwords == 0 {
+        let guest_lds = self.guest_lds_dwords();
+        if guest_lds == 0 {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
@@ -3293,7 +3362,7 @@ impl<'a> Lower<'a> {
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
             let index = l.s.m.bin(c, Bin::LShr, at, two);
-            let n = l.s.m.i32(l.s.lds_dwords);
+            let n = l.s.m.i32(guest_lds);
             let inside = l.s.m.cmp(c, pred::IULT, index, n);
             let zero = l.s.m.i32(0);
             let index = l.s.m.select(c, inside, index, zero);
@@ -4098,6 +4167,9 @@ impl<'a> Lower<'a> {
 
     fn scc_in(&mut self, inst: &Inst) -> Result<V, Why> {
         let v = inst.read(Reg::Scc).ok_or("an unread SCC")?;
+        if let Some(&mask) = self.x.st.wave_scc.get(&v) {
+            return self.paired_vote(mask, self.cur, true);
+        }
         match self.get(v)? {
             Val::Bit(x) => Ok(x),
             _ => Err("SCC without a value"),
@@ -5668,6 +5740,9 @@ impl<'a> Lower<'a> {
                 let set = self.lane_heap_index(a, sampler)?;
                 let clear = self.lane_heap_index(b, sampler)?;
                 Ok(self.s.m.select(self.cur, cond, set, clear))
+            }
+            Source::LanePhi { .. } if self.twin.is_some() => {
+                Err("a per-lane descriptor phi in paired compute")
             }
             Source::LanePhi { block, args } => {
                 // Each predecessor computes its heap index at its end (what
@@ -8226,6 +8301,9 @@ impl<'a> Lower<'a> {
     fn lane_edge(&self, q: usize, b: usize) -> Vec<(Bool, bool)> {
         let st = self.x.st;
         let mut all = vec![(st.reach[q], true)];
+        if st.wave_branches.get(q).is_some_and(Option::is_some) {
+            return all;
+        }
         if let LaneExit::Branch {
             when,
             taken,
@@ -10168,18 +10246,20 @@ impl<'a> Lower<'a> {
                 not_taken,
             } => {
                 // A negated condition branches the other way round.
-                let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
-                    Some((atom, Bool::TRUE, Bool::FALSE)) => {
-                        let a = self
-                            .atom(atom, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
-                        (a, not_taken, taken)
-                    }
-                    _ => {
-                        let c = self
-                            .boolean(when, self.cur)
-                            .map_err(|w| unsupported(offset, w))?;
-                        (c, taken, not_taken)
+                let (cond, taken, not_taken) = if let Some(Some(any)) = self.x.st.wave_branches.get(b) {
+                    let cond = self.paired_vote(when, self.cur, *any)
+                        .map_err(|why| unsupported(offset, why))?;
+                    (cond, taken, not_taken)
+                } else {
+                    match self.x.st.bools.node(when) {
+                        Some((atom, Bool::TRUE, Bool::FALSE)) => {
+                            let a = self.atom(atom, self.cur).map_err(|w| unsupported(offset, w))?;
+                            (a, not_taken, taken)
+                        }
+                        _ => {
+                            let c = self.boolean(when, self.cur).map_err(|w| unsupported(offset, w))?;
+                            (c, taken, not_taken)
+                        }
                     }
                 };
                 // A back edge is taken only below the iteration limit.
@@ -10844,7 +10924,8 @@ impl<'a> Lower<'a> {
                     // No lane from this edge reads it, or no lane comes
                     // along it at all: any value will do.
                     _ if read
-                        && (self.never_taken(q, b) || self.dead_on_edge(b, n, phi.reg)) =>
+                        && (self.never_taken(q, b)
+                            || self.twin.is_none() && self.dead_on_edge(b, n, phi.reg)) =>
                     {
                         if bit {
                             self.s.m.bool(false)
