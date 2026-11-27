@@ -497,6 +497,17 @@ fn pairs_on() -> bool {
 thread_local! {
     /// A test's choice for [`pairs_on`], for its thread only.
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+    // Test binaries only. Production keeps the independent refusal.
+    static TEST_PARTIAL_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn partial_pairs_experiment() -> bool {
+    #[cfg(test)]
+    {
+        TEST_PARTIAL_PAIRS.get()
+    }
+    #[cfg(not(test))]
+    false
 }
 
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
@@ -879,10 +890,17 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    if cs.threads.iter().product::<u32>() % 64 != 0 {
+    let threads = cs.threads.iter().product::<u32>();
+    if threads % 64 != 0 && !partial_pairs_experiment() {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired lanes in a thread group that does not fill its console waves",
+        });
+    }
+    if partial_pairs_experiment() && threads % 64 != 0 && threads > 64 && cs.lds_bytes() >= 32768 {
+        return Err(ShaderError::Unsupported {
+            offset: 0,
+            what: "partial paired waves without a private LDS allocation counter",
         });
     }
     // every per-lane branch the wave's; again while that leaves another branch per lane

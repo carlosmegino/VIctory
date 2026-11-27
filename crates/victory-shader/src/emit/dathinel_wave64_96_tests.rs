@@ -43,22 +43,35 @@ const fn ds(op: u32, dst: u32, address: u32, data: u32) -> [u32; 2] {
     [0xD800_0000 | op << 18, dst << 24 | data << 8 | address]
 }
 
-fn guest(threads: u32) -> NativeProgram {
-    let mut words = vec![
+fn guest(dims: [u32; 3], matrix: bool) -> NativeProgram {
+    let [x, y, z] = dims;
+    let threads = x * y * z;
+    let mut words = Vec::new();
+    if y != 1 || z != 1 {
+        // v0 = x_id + x * y_id + (x * y) * z_id. The 3D test uses inline multipliers.
+        assert!(x * y <= 64);
+        words.extend([
+            0xD543_0000, // v_mad_u32_u24 v0, v1, x, v0
+            v(1) | (k(x) << 9) | (v(0) << 18),
+            0xD543_0000, // v_mad_u32_u24 v0, v2, x*y, v0
+            v(2) | (k(x * y) << 9) | (v(0) << 18),
+        ]);
+    }
+    words.extend([
         alu(0x16, 1, k(6), 0),  // v1: logical wave index
         alu(0x1B, 2, k(63), 0), // v2: logical lane index
         alu(0x1A, 11, k(2), 1), // v11: byte address of wave's LDS counter
         mov(12, k(0)),
         sop1(4, 22, EXEC),
         cmp(0xD2, k(0), 2), // only logical lane 0 initializes this wave's counter
-    ];
+    ]);
     words.extend(ds(0x0D, 0, 11, 12));
     words.extend([
         sop1(4, EXEC, 22),
         alu(0x1B, 3, k(3), 2),
         alu(0x25, 3, k(1), 3),
         alu(0x25, 3, v(1), 3), // rounds = 1 + (lane & 3) + wave
-        mov(4, k(if threads == 96 { 11 } else { 0 })),
+        mov(4, k(if threads == 96 || matrix { 11 } else { 0 })),
         mov(13, k(1)),
         sop1(4, 20, EXEC),
         alu(0x25, 4, v(2), 4), // loop: accumulate the lane number
@@ -76,7 +89,7 @@ fn guest(threads: u32) -> NativeProgram {
     // Wave 0 first reads lane 40 and then lane 20. Wave 1 selects lane 24
     // and then lane 36, so the same instruction selects opposite halves.
     // Alternate the elected half by wave parity for groups with four waves.
-    let selector = if threads == 256 {
+    let selector = if threads == 256 || matrix {
         words.push(alu(0x1B, 8, k(1), 1)); // v8 = wave index & 1
         8
     } else {
@@ -98,7 +111,11 @@ fn guest(threads: u32) -> NativeProgram {
     // opposite half. The guest needs ordering within its wave without s_barrier.
     words.extend([
         alu(0x1A, 10, k(2), 0),
-        alu(0x1D, 14, k(if threads % 64 != 0 { 8 } else { 32 }), 0),
+        if matrix {
+            alu(0x1B, 14, 200, 0) // v_and_b32 v14, -8, v0: an existing writer for any tail size
+        } else {
+            alu(0x1D, 14, k(if threads % 64 != 0 { 8 } else { 32 }), 0)
+        },
         alu(0x1A, 14, k(2), 14),
     ]);
     let counter_bytes = (threads.div_ceil(64) * 4).max(8);
@@ -108,13 +125,31 @@ fn guest(threads: u32) -> NativeProgram {
     words.extend([op | counter_bytes, args]);
 
     if threads > 64 {
-        words.extend([0xBF8A_0000, alu(0x1D, 14, k(4), 11)]); // s_barrier, then other wave's LDS
+        words.extend([
+            0xBF8A_0000, // s_barrier, then read an existing wave's counter
+            if matrix {
+                mov(14, k(0))
+            } else {
+                alu(0x1D, 14, k(4), 11)
+            },
+        ]);
         words.extend(ds(0x36, 7, 14, 0));
     } else {
         words.push(mov(7, v(5)));
     }
     words.extend([alu(0x1A, 15, k(2), 0), 0xBE85_0380]); // output offset and table address high
-    for (slot, reg) in [4, 5, 6, 9, 7, 10, 0].into_iter().enumerate() {
+    let identity = if matrix {
+        words.extend([
+            sop1(0x10, 16, EXEC),   // s_bcnt1_i32_b64 s16, exec
+            mov(1, 16),             // v_mov_b32 v1, s16
+            alu(0x1A, 1, k(16), 1), // population in the high word, flat id in the low word
+            alu(0x1C, 1, v(1), 0),
+        ]);
+        1
+    } else {
+        0
+    };
+    for (slot, reg) in [4, 5, 6, 9, 7, 10, identity].into_iter().enumerate() {
         words.extend([
             0x3D << 26 | 0x02 << 18 | 8 << 6 | 2, // s_load_dwordx4 s[8:11], s[4:5]
             125 << 25 | (slot as u32 * 32),
@@ -149,8 +184,10 @@ fn guest(threads: u32) -> NativeProgram {
             })
             .collect(),
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1 | ((counter_bytes + threads * 4).div_ceil(512).max(2) << 15),
-            threads: [threads, 1, 1],
+            rsrc2: 5 << 1
+                | ((u32::from(y != 1 || z != 1) * 2) << 11)
+                | ((counter_bytes + threads * 4).div_ceil(512).max(2) << 15),
+            threads: dims,
         }),
         code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
     }
@@ -180,6 +217,24 @@ fn oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
     ]
 }
 
+fn matrix_oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
+    let (wave, lane) = (thread / 64, thread % 64);
+    let present = |wave: u32| (threads - wave * 64).min(64);
+    let total = |wave| (0..present(wave)).map(|lane| 1 + lane % 4 + wave).sum();
+    let value = |lane| 11 + lane * (1 + lane % 4 + wave);
+    let elect = |first| value(if first < present(wave) { first } else { 0 });
+    let parity = (wave & 1) as usize;
+    [
+        value(lane),
+        total(wave),
+        elect([40, 24][parity]),
+        elect([20, 36][parity]),
+        total(0),
+        value(lane & !7),
+        thread | (present(wave) << 16),
+    ]
+}
+
 fn debug_warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
     // SAFETY: All read buffers are aligned and sized by the info queue.
     unsafe {
@@ -202,6 +257,11 @@ fn debug_warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
 }
 
 fn run(threads: u32) {
+    run_case([threads, 1, 1], false, false);
+}
+
+fn run_case(dims: [u32; 3], experiment: bool, matrix: bool) {
+    let threads = dims.into_iter().product::<u32>();
     static DEBUG: std::sync::Once = std::sync::Once::new();
     // SAFETY: These opt-in tests run in isolation and enable the debug layer
     // before creating the first device in the test process.
@@ -234,8 +294,11 @@ fn run(threads: u32) {
     // Use the same host capability as the runtime and enter through the
     // public translator. Neither the paired form nor a wave override is used.
     super::set_host_max_wave(caps.WaveLaneCountMax);
-    let bytes = crate::native::tests::compute_uav_container(&guest(threads));
-    let mut shader = super::translate(&bytes).expect("translate synthetic wave64 container");
+    let bytes = crate::native::tests::compute_uav_container(&guest(dims, matrix));
+    let restore = super::TEST_PARTIAL_PAIRS.replace(experiment);
+    let translated = super::translate(&bytes);
+    super::TEST_PARTIAL_PAIRS.set(restore);
+    let mut shader = translated.expect("translate synthetic wave64 container");
     validator::Validator::load(validator::Validator::default_path().as_deref())
         .expect("DXIL validator")
         .validate(&mut shader.dxil)
@@ -249,7 +312,7 @@ fn run(threads: u32) {
     let emitted = Container::parse(&shader.dxil).unwrap();
     let psv = emitted.part(FourCC::PSV0).unwrap();
     eprintln!(
-        "ROUTE: guest={}, physical={}, wave-range={}..{}",
+        "ROUTE: guest={} {dims:?}, physical={}, wave-range={}..{}",
         threads,
         u32_at(psv.data, 40).unwrap(),
         u32_at(psv.data, 20).unwrap(),
@@ -272,23 +335,24 @@ fn run(threads: u32) {
     let warnings = debug_warnings(&queue);
     assert!(warnings.is_empty(), "D3D12 validation: {warnings:#?}");
     assert_eq!(out.len(), OUTPUTS);
+    let expected = if matrix { matrix_oracle } else { oracle };
     let mut failures = 0;
     for (slot, words) in out.iter().enumerate() {
         assert_eq!(words.len(), threads as usize + GUARD);
         let mut count = 0;
         for thread in 0..threads {
-            let want = oracle(threads, thread)[slot];
+            let want = expected(threads, thread)[slot];
             if words[thread as usize] != want {
                 count += 1;
             }
         }
         failures += count;
         eprintln!(
-            "CHECK: UAV={slot} mismatches={count}/{threads}; t0={} expected={}; t64={} expected={}",
+            "CHECK: UAV={slot} mismatches={count}/{threads}; t0={} expected={}; last={} expected={}",
             words[0],
-            oracle(threads, 0)[slot],
-            words[64],
-            oracle(threads, 64)[slot]
+            expected(threads, 0)[slot],
+            words[(threads - 1) as usize],
+            expected(threads, threads - 1)[slot]
         );
         assert_eq!(&words[threads as usize..], &[0; GUARD], "UAV {slot} guard");
     }
@@ -344,12 +408,32 @@ fn wave64_missing_half_96() {
     run(96);
 }
 
+#[test]
+#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+fn paired_partial_96_oracle() {
+    run_case([96, 1, 1], true, false);
+}
+
+#[test]
+#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+fn paired_partial_size_matrix() {
+    for threads in [1, 31, 32, 33, 63, 65, 95, 97, 127, 129, 1023] {
+        run_case([threads, 1, 1], true, true);
+    }
+}
+
+#[test]
+#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+fn paired_partial_3d_group() {
+    run_case([3, 11, 3], true, true);
+}
+
 // The paired backend deliberately has no partial-group execution yet.
 #[test]
 fn wave64_partial_group_refusal_96() {
     let was = super::lower::TEST_HOST_WAVE.replace(Some(32));
     let pairs = super::TEST_PAIRS.replace(Some(true));
-    let bytes = crate::native::tests::compute_uav_container(&guest(96));
+    let bytes = crate::native::tests::compute_uav_container(&guest([96, 1, 1], false));
     let result = super::translate(&bytes);
     super::TEST_PAIRS.set(pairs);
     super::lower::TEST_HOST_WAVE.set(was);

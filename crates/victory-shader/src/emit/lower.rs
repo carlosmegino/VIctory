@@ -316,6 +316,8 @@ struct Lower<'a> {
     /// console lane the host lane plus 32).
     twin: Option<Box<LaneState>>,
     upper: bool,
+    partial_threads: Option<u32>,
+    guest_presence: [Option<V>; 2],
     /// The paired form: whether the last LDS access of the IR block being lowered wrote (none
     /// at its start), for the fences between accesses ([`Self::paired_inst`]).
     lds_last: Option<bool>,
@@ -1093,11 +1095,18 @@ impl<'a> Lower<'a> {
         // a console wave64 program in host waves of 32: the LDS dword of `wave_base`'s counter
         let mut halves: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
+        let partial_threads = match x.native.io {
+            StageIo::Cs(cs) if paired && super::partial_pairs_experiment() => {
+                let threads = cs.threads.iter().product::<u32>();
+                (threads % 64 != 0).then_some(threads)
+            }
+            _ => None,
+        };
         if let StageIo::Cs(cs) = x.native.io
             && paired
         {
             // (`with_paired_lanes`) a host wave of 32 for each console wave of the group, its
-            // threads in a row; the caller has checked that the console's waves are full
+            // threads in a row, including a complete host wave for a partial guest wave.
             let waves = cs.threads.iter().product::<u32>().div_ceil(64);
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = cs.lds_bytes() / 4;
@@ -1431,6 +1440,8 @@ impl<'a> Lower<'a> {
             abort: None,
             twin: paired.then(Box::default),
             upper: false,
+            partial_threads,
+            guest_presence: [None; 2],
             lds_last: None,
             lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
             drop_in,
@@ -1958,7 +1969,7 @@ impl<'a> Lower<'a> {
         let &m = self.x.st.masks.get(&mask).ok_or("a wave reduction's untracked mask")?;
         let c = self.cur;
         let [lo, hi] = self.both(|l| {
-            let on = l.boolean(m, c)?;
+            let on = l.guest_predicate(m, c, false)?;
             let x = l.i32_of(src)?;
             let id = l.s.m.i32(ident);
             Ok(l.s.m.select(c, on, x, id))
@@ -3164,7 +3175,7 @@ impl<'a> Lower<'a> {
                 }
                 // (the paired form: the upper lanes' bits too, lanes 32-63)
                 let bits = if self.twin.is_some() {
-                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
+                    self.both(|l| l.guest_predicate(m, at, false)).map(|[a, b]| (a, Some(b)))
                 } else {
                     self.boolean(m, at).map(|a| (a, None))
                 };
@@ -3580,6 +3591,33 @@ impl<'a> Lower<'a> {
 
     // ---- lane booleans ----
 
+    /// A logical lane is present only if its flat guest id is inside the group.
+    /// Keep this separate from mutable EXEC and from the host wave's activity.
+    fn guest_presence(&mut self) -> Option<V> {
+        let threads = self.partial_threads?;
+        let half = usize::from(self.upper);
+        if let Some(present) = self.guest_presence[half] {
+            return Some(present);
+        }
+        let tid = self.console_thread();
+        let size = self.s.m.i32(threads);
+        let present = self.s.m.cmp(self.s.entry, pred::IULT, tid, size);
+        self.guest_presence[half] = Some(present);
+        Some(present)
+    }
+
+    /// At a lane-set consumer, absent lanes contribute its neutral truth value.
+    fn guest_predicate(&mut self, cond: Bool, at: usize, absent: bool) -> Result<V, Why> {
+        let value = self.boolean(cond, at)?;
+        Ok(match self.guest_presence() {
+            Some(present) => {
+                let neutral = self.s.m.bool(absent);
+                self.s.m.select(at, present, value, neutral)
+            }
+            None => value,
+        })
+    }
+
     fn boolean(&mut self, b: Bool, at: usize) -> Result<V, Why> {
         if b == Bool::TRUE || b == Bool::FALSE {
             return Ok(self.s.m.bool(b == Bool::TRUE));
@@ -3843,7 +3881,7 @@ impl<'a> Lower<'a> {
         };
         if self.twin.is_some() {
             let at = at(self)?;
-            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
+            let [lo, hi] = self.both(|l| l.guest_predicate(m, at, false))?;
             let either = self.s.m.bin(at, Bin::Or, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             return Ok(self.s.op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[either]));
@@ -3880,7 +3918,7 @@ impl<'a> Lower<'a> {
             // says what it says on the console (no set bit for "some lane", no objection to
             // "every lane").
             let c = self.cur;
-            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
+            let [lo, hi] = self.both(|l| l.guest_predicate(when, c, !any))?;
             let pair = self.s.m.bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
             self.s.flags |= flags::WAVE_OPS;
             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
@@ -3992,8 +4030,8 @@ impl<'a> Lower<'a> {
 
     fn guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
         match self.x.st.guards[b][i] {
-            None => Ok(None),
-            Some(g) => Ok(Some(self.boolean(g, self.cur)?)),
+            None => Ok(self.guest_presence()),
+            Some(g) => Ok(Some(self.guest_predicate(g, self.cur, false)?)),
         }
     }
 
@@ -4144,6 +4182,16 @@ impl<'a> Lower<'a> {
                 phi
             })
             .collect()
+    }
+
+    fn load_guest_lds(&mut self, ptr: V, guard: Option<V>) -> V {
+        if self.partial_threads.is_none() {
+            return self.s.m.load(self.cur, ptr);
+        }
+        let at = self.begin_guarded(guard);
+        let value = self.s.m.load(self.cur, ptr);
+        let zero = self.s.m.i32(0);
+        self.end_guarded(at, &[(value, zero)])[0]
     }
 
     /// Code that depends on the lane layout: wave operations, and in compute
@@ -4598,7 +4646,8 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.s.m.load(c, p);
+                let w = self.load_guest_lds(p, guard);
+                let c = self.cur;
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
                     let k = self.s.m.i32(32 - bits);
@@ -4661,7 +4710,7 @@ impl<'a> Lower<'a> {
             for (off, w) in elements {
                 for k in 0..w {
                     let p = dword(self, off + 4 * k);
-                    let x = self.s.m.load(self.cur, p);
+                    let x = self.load_guest_lds(p, guard);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
