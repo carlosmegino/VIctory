@@ -683,6 +683,260 @@ fn paired_wave_private_counter_promotion_matches_all_outputs() {
     run_guest([96, 1, 1], promoted_counter_guest(96), oracle, false);
 }
 
+fn analyzed_counter_guest(native: &NativeProgram) -> super::private_lds::Promotion {
+    let p = crate::ir::build(&native.code, true, native.vgprs).unwrap();
+    super::private_lds::promote(native, &p).unwrap_or_else(|why| {
+        panic!(
+            "promotion refused: {why}; blocks={:#?}",
+            p.blocks
+                .iter()
+                .map(|b| (b.offset, &b.preds, b.exit))
+                .collect::<Vec<_>>()
+        )
+    })
+}
+
+#[test]
+fn private_lds_analysis_accepts_original_and_rejects_aliases() {
+    for threads in [64, 96, 97, 128, 256] {
+        let native = guest(threads);
+        let before = native.code.clone();
+        let proof = analyzed_counter_guest(&native);
+        assert_eq!(native.code, before, "original input is immutable");
+        assert_eq!(
+            proof.counter_addresses,
+            (0..threads.div_ceil(64)).map(|w| w * 4).collect::<Vec<_>>()
+        );
+        assert_eq!((proof.scalar_words, proof.vector_words), (6, 1));
+        assert!(proof.atomic_offset < proof.publication_offset);
+        let decoded = crate::gfx10::decode(&proof.native.code).unwrap();
+        assert!(!decoded.iter().any(|i| i.name() == Some("ds_add_u32")));
+        crate::ir::build(&proof.native.code, true, proof.native.vgprs).unwrap();
+    }
+    let original = guest(96);
+    let change = |from: &[u32], to: &[u32]| {
+        let mut n = original.clone();
+        let mut words: Vec<_> = n
+            .code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .copied()
+            .map(u32::from_le_bytes)
+            .collect();
+        let at = words.windows(from.len()).position(|w| w == from).unwrap();
+        words.splice(at..at + from.len(), to.iter().copied());
+        n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        n
+    };
+    let cases = [
+        (
+            "waves alias",
+            change(&[alu(0x1A, 11, k(2), 1)], &[mov(11, k(0))]),
+        ),
+        (
+            "unknown indirect address",
+            change(&[alu(0x1A, 11, k(2), 1)], &[mov(11, v(15))]),
+        ),
+        (
+            "lane-private words are not one wave counter",
+            change(&[alu(0x1A, 11, k(2), 1)], &[alu(0x1A, 11, k(2), 0)]),
+        ),
+        (
+            "non-unit atomic",
+            change(&[mov(13, k(1))], &[mov(13, k(2))]),
+        ),
+        (
+            "nonzero initialization",
+            change(&[mov(12, k(0))], &[mov(12, k(1))]),
+        ),
+        (
+            "scratch aliases counter",
+            change(&[ds(0x0D, 0, 10, 4)[0] | 8], &[ds(0x0D, 0, 10, 4)[0]]),
+        ),
+        (
+            "returning atomic",
+            change(&ds(0, 0, 11, 13), &ds(0x20, 12, 11, 13)),
+        ),
+        (
+            "GDS",
+            change(
+                &ds(0, 0, 11, 13),
+                &[ds(0, 0, 11, 13)[0] | (1 << 17), ds(0, 0, 11, 13)[1]],
+            ),
+        ),
+        (
+            "loop-varying address",
+            change(&[alu(0x25, 4, v(2), 4)], &[alu(0x25, 11, k(1), 11)]),
+        ),
+        (
+            "missing peer barrier",
+            change(&[0xBF8A_0000], &[0xBF80_0000]),
+        ),
+        (
+            "uninitialized lane zero",
+            change(&[cmp(0xD2, k(0), 2)], &[cmp(0xD2, k(1), 2)]),
+        ),
+        (
+            "resurrect missing EXEC lanes",
+            change(
+                &[0x8000_0000 | 0x0F << 23 | EXEC << 16 | VCC << 8 | EXEC],
+                &[0x8000_0000 | 0x11 << 23 | EXEC << 16 | 193 << 8 | EXEC],
+            ),
+        ),
+        ("live SCC", {
+            let mut n = change(
+                &[0x8000_0000 | 0x0F << 23 | EXEC << 16 | VCC << 8 | EXEC],
+                &[sop1(4, EXEC, EXEC)],
+            );
+            let mut words: Vec<_> = n
+                .code
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .copied()
+                .map(u32::from_le_bytes)
+                .collect();
+            let branch = words.iter_mut().find(|w| **w == 0xBF89_FFF9).unwrap();
+            *branch = 0xBF85_FFF9;
+            n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+            n
+        }),
+    ];
+    for (label, n) in cases {
+        let p = crate::ir::build(&n.code, true, n.vgprs).unwrap();
+        let result = super::private_lds::promote(&n, &p);
+        assert!(result.is_err(), "must reject {label}");
+        eprintln!("PRIVATE_LDS_REFUSAL {label}: {}", result.err().unwrap());
+    }
+    let variant = indirect_counter_guest();
+    analyzed_counter_guest(&variant);
+}
+
+fn indirect_counter_guest() -> NativeProgram {
+    let mut n = guest(96);
+    let mut words: Vec<_> = n
+        .code
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_le_bytes)
+        .collect();
+    let at = words
+        .windows(2)
+        .position(|w| w == ds(0, 0, 11, 13))
+        .unwrap();
+    words[at + 1] = ds(0, 0, 15, 13)[1];
+    let mask = words
+        .iter_mut()
+        .find(|w| **w == alu(0x1B, 3, k(3), 2))
+        .unwrap();
+    *mask = alu(0x1B, 3, k(5), 2);
+    // A register copy carries the indirect address. Both ends of the loop's
+    // backedge move by one dword, so its original relative offset is retained.
+    words.insert(3, mov(15, v(11)));
+    n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    n
+}
+
+fn indirect_counter_oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
+    let wave = thread / 64;
+    let lane = thread % 64;
+    let value = |lane| 11 + lane * (1 + (lane & 5) + wave);
+    let total = |wave: u32| {
+        (0..(threads - wave * 64).min(64))
+            .map(|lane| 1 + (lane & 5) + wave)
+            .sum()
+    };
+    [
+        value(lane),
+        total(wave),
+        value([40, 24][wave as usize]),
+        value(if wave == 1 { 0 } else { 20 }),
+        total(wave ^ 1),
+        value(lane ^ 8),
+        thread,
+    ]
+}
+
+#[test]
+fn private_lds_analysis_costs_are_not_hardware_occupancy() {
+    let native = guest(96);
+    let proof = analyzed_counter_guest(&native);
+    let old = super::lower::TEST_HOST_WAVE.replace(Some(32));
+    assert!(
+        translate_static(&native).is_err(),
+        "unoptimized program remains refused"
+    );
+    let shader = translate_static(&proof.native).unwrap();
+    super::lower::TEST_HOST_WAVE.set(old);
+    let original = crate::gfx10::decode(&native.code).unwrap();
+    let transformed = crate::gfx10::decode(&proof.native.code).unwrap();
+    for code in [&original, &transformed] {
+        assert_eq!(
+            code.iter()
+                .filter(|i| i.name() == Some("s_barrier"))
+                .count(),
+            1
+        );
+    }
+    assert_eq!(
+        transformed
+            .iter()
+            .filter(|i| i.name() == Some("ds_add_u32"))
+            .count(),
+        0
+    );
+    // Count actual per-lane guest contributions using the independent oracle.
+    let atomics: u32 = [0, 64].into_iter().map(|t| oracle(96, t)[1]).sum();
+    let original_lds = 2 + atomics + 4 * 96;
+    let promoted_lds = 2 + 2 + 4 * 96;
+    assert_eq!((atomics, original_lds, promoted_lds), (272, 658, 388));
+    eprintln!(
+        "PRIVATE_LDS_COST guest-dynamic atomics=272->0 LDS-accesses=658->388 explicit-barriers=1->1 allocated-extra-scalar-words=6 allocated-extra-vector-words=1 physical-registers=unmeasured occupancy=unmeasured"
+    );
+    if let Some(census) = super::census::take(&shader.dxil) {
+        for (kind, count) in super::census::KINDS.into_iter().zip(census.counts) {
+            if [
+                "total",
+                "lds_load",
+                "lds_store",
+                "atomic",
+                "barrier",
+                "phi",
+                "wave_op",
+                "blocks",
+            ]
+            .contains(&kind)
+            {
+                eprintln!("PRIVATE_LDS_DXIL {kind}={count}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "isolated Wave32 hardware test with Graphics Tools and DXIL validator"]
+fn paired_analyzed_original_96_matches_all_outputs() {
+    let original = guest(96);
+    let before = original.code.clone();
+    let proof = analyzed_counter_guest(&original);
+    assert_eq!(original.code, before);
+    eprintln!(
+        "PRIVATE_LDS original96 counter-addresses={:?} extra-scalars={} extra-vectors={} atomic={} publication={}",
+        proof.counter_addresses,
+        proof.scalar_words,
+        proof.vector_words,
+        proof.atomic_offset,
+        proof.publication_offset
+    );
+    run_guest([96, 1, 1], proof.native, oracle, false);
+    let indirect = indirect_counter_guest();
+    let proof = analyzed_counter_guest(&indirect);
+    run_guest([96, 1, 1], proof.native, indirect_counter_oracle, false);
+}
+
 // Original Dathinel 561503d oracle, unchanged.
 fn oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
     let wave = thread / 64;
