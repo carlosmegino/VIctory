@@ -564,3 +564,146 @@ fn static_partial_archive_preserves_the_existing_route() {
         items.lines().count()
     );
 }
+// Test-only promotion witness for Dathinel's exact wave-private counter.
+// This is not an optimizer for arbitrary guest LDS accesses.
+fn promoted_counter_guest(threads: u32) -> NativeProgram {
+    let mut native = guest(threads);
+    let mut words: Vec<u32> = native
+        .code
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .copied()
+        .map(u32::from_le_bytes)
+        .collect();
+    // v11 = 4 * (tid >> 6), and the invariant addend v13 is exactly 1.
+    assert_eq!(
+        &words[..3],
+        &[
+            alu(0x16, 1, k(6), 0),
+            alu(0x1B, 2, k(63), 0),
+            alu(0x1A, 11, k(2), 1)
+        ]
+    );
+    assert_eq!(words.iter().filter(|&&w| w == mov(13, k(1))).count(), 1);
+    let add = ds(0, 0, 11, 13);
+    let adds: Vec<_> = words
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| *w == add)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(adds.len(), 1);
+    let branch = words
+        .iter()
+        .position(|w| w & 0xFFFF_0000 == 0xBF89_0000)
+        .unwrap();
+    let top = ((branch + 1) as isize + (words[branch] as i16) as isize) as usize;
+    assert_eq!(words[top], alu(0x25, 4, v(2), 4));
+    assert!(top < adds[0] && adds[0] < branch);
+    // No other LDS instruction occurs in this loop and no atomic result is read.
+    let decoded = crate::gfx10::decode(&native.code).unwrap();
+    let inside: Vec<_> = decoded
+        .iter()
+        .filter(|i| {
+            i.offset >= top * 4
+                && i.offset < branch * 4
+                && matches!(i.fields(true), crate::gfx10::Fields::Ds { .. })
+        })
+        .collect();
+    assert_eq!(inside.len(), 1);
+    assert_eq!(inside[0].name(), Some("ds_add_u32"));
+    // Every original atomic contribution is counted, modulo 2^32. Scalar
+    // state is per logical wave in paired; there is no group sync in the loop.
+    words.splice(
+        adds[0]..adds[0] + 2,
+        [sop1(0x10, 28, EXEC), 0x8000_0000 | 30 << 16 | 28 << 8 | 30],
+    );
+    words.insert(top, sop1(3, 30, k(0))); // s30 counter; existing backedge skips this initializer
+    let read = ds(0x36, 5, 11, 0);
+    let publish = words.windows(2).position(|w| w == read).unwrap();
+    let mut materialize = vec![sop1(4, 32, EXEC), cmp(0xD2, k(0), 2), mov(12, 30)];
+    materialize.extend(ds(0x0D, 0, 11, 12));
+    materialize.push(sop1(4, EXEC, 32));
+    words.splice(publish..publish, materialize);
+    native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    native
+}
+
+#[test]
+fn wave_private_counter_promotion_preserves_wrapping_contributions() {
+    for threads in [1u32, 32, 33, 64, 96, 97, 128, 256, 1023] {
+        let waves = threads.div_ceil(64);
+        let mut memory = vec![u32::MAX - 37; waves as usize];
+        let mut registers = memory.clone();
+        for wave in 0..waves {
+            let end = (wave * 64 + 64).min(threads);
+            for round in 0..(4 + wave) {
+                let live = (wave * 64..end).filter(|lane| round < 1 + (lane & 3) + wave);
+                let mut contribution = 0u32;
+                for lane in live {
+                    let value = lane.wrapping_mul(0x9E37_79B9).wrapping_add(1);
+                    memory[wave as usize] = memory[wave as usize].wrapping_add(value);
+                    contribution = contribution.wrapping_add(value);
+                }
+                registers[wave as usize] = registers[wave as usize].wrapping_add(contribution);
+            }
+        }
+        assert_eq!(memory, registers);
+    }
+    for threads in [64, 96] {
+        let n = promoted_counter_guest(threads);
+        let decoded = crate::gfx10::decode(&n.code).unwrap();
+        assert!(!decoded.iter().any(|i| i.name() == Some("ds_add_u32")));
+        let branch = decoded
+            .iter()
+            .find(|i| i.name() == Some("s_cbranch_execnz"))
+            .unwrap();
+        let target = branch.offset as isize + 4 + (branch.words[0] as i16) as isize * 4;
+        let top = decoded
+            .iter()
+            .find(|i| i.offset as isize == target)
+            .unwrap();
+        assert_eq!(top.words, [alu(0x25, 4, v(2), 4)]);
+        let bytes = crate::dxbc::build(&[]);
+        let c = Container::parse(&bytes).unwrap();
+        let p = crate::ir::build(&n.code, true, n.vgprs).unwrap();
+        let old = super::lower::TEST_HOST_WAVE.replace(Some(32));
+        let result = super::paired_impl(&c, &n, &p, !threads.is_multiple_of(64));
+        super::lower::TEST_HOST_WAVE.set(old);
+        result.expect("counter promotion removes the loop's only implicit group rendezvous");
+        eprintln!("PROMOTION_ADMISSION threads={threads}: exact paired lowering admitted");
+    }
+}
+
+#[test]
+#[ignore = "isolated wave32 GPU test with Graphics Tools and DXIL validator"]
+fn paired_wave_private_counter_promotion_matches_all_outputs() {
+    // A new 96-thread witness on 741aa8e, not the historical b3060be result.
+    run_guest([96, 1, 1], promoted_counter_guest(96), oracle, false);
+}
+
+// Original Dathinel 561503d oracle, unchanged.
+fn oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
+    let wave = thread / 64;
+    let lane = thread % 64;
+    let lane_sum = |lane| u32::from(threads == 96) * 11 + lane * (1 + (lane % 4) + wave);
+    let wave_total = |wave: u32| {
+        (0..(threads - wave * 64).min(64))
+            .map(|lane| 1 + lane % 4 + wave)
+            .sum()
+    };
+    [
+        lane_sum(lane),
+        wave_total(wave),
+        lane_sum([40, 24][(wave & 1) as usize]),
+        lane_sum(if threads == 96 && wave == 1 {
+            0
+        } else {
+            [20, 36][(wave & 1) as usize]
+        }),
+        wave_total(if threads > 64 { wave ^ 1 } else { wave }),
+        lane_sum(lane ^ if threads % 64 != 0 { 8 } else { 32 }),
+        thread,
+    ]
+}
