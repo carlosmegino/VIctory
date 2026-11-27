@@ -43,7 +43,7 @@ const fn ds(op: u32, dst: u32, address: u32, data: u32) -> [u32; 2] {
     [0xD800_0000 | op << 18, dst << 24 | data << 8 | address]
 }
 
-fn guest(dims: [u32; 3], matrix: bool) -> NativeProgram {
+pub(super) fn guest(dims: [u32; 3], matrix: bool) -> NativeProgram {
     let [x, y, z] = dims;
     let threads = x * y * z;
     let mut words = Vec::new();

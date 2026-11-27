@@ -291,4 +291,7 @@ fn wave64_write_runtime_fixtures() {
         std::fs::write(dir.join(format!("wave64-{threads}.cdxil")), &bytes)
             .expect("write synthetic container");
     }
+    let partial = super::dathinel_wave64_96_tests::guest([96, 1, 1], false);
+    let bytes = crate::native::tests::compute_uav_container(&partial);
+    std::fs::write(dir.join("wave64-96.cdxil"), bytes).expect("write Dathinel's synthetic container");
 }

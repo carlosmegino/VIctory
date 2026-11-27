@@ -10,6 +10,16 @@ use windows::core::Interface;
 #[test]
 #[ignore = "requires pre-generated synthetic wave64 containers, a wave32 GPU and D3D12 Graphics Tools"]
 fn wave64_runtime_selects_paired_compute_pipelines() {
+    check_paired_compute_pipelines(&[64, 128]);
+}
+
+#[test]
+#[ignore = "requires the generated 96-thread synthetic container, a wave32 GPU and D3D12 Graphics Tools"]
+fn wave64_runtime_selects_partial_paired_compute_pipeline() {
+    check_paired_compute_pipelines(&[96]);
+}
+
+fn check_paired_compute_pipelines(sizes: &[u32]) {
     let fixtures = std::path::PathBuf::from(
         std::env::var_os("VICTORY_TEST_WAVE64_DIR").expect("synthetic fixture directory"),
     );
@@ -32,7 +42,7 @@ fn wave64_runtime_selects_paired_compute_pipelines() {
     crate::descriptor::host::probe_view_limit();
     // SAFETY: This isolated test owns the queue's observation window.
     unsafe { messages.ClearStoredMessages() };
-    for threads in [64, 128] {
+    for &threads in sizes {
         let bytes = std::fs::read(fixtures.join(format!("wave64-{threads}.cdxil")))
             .expect("read the generated synthetic container");
         let desc = ComputeHead {
@@ -68,7 +78,7 @@ fn wave64_runtime_selects_paired_compute_pipelines() {
         let physical_x = u32::from_le_bytes(psv.data[40..44].try_into().unwrap());
         assert_eq!(
             physical_x,
-            threads / 2,
+            threads.div_ceil(64) * 32,
             "runtime did not select the paired form"
         );
         eprintln!("runtime PSO: {threads} guest threads, {physical_x} physical threads");

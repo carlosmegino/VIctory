@@ -300,3 +300,16 @@ pub(super) fn check(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn paired_dimensions_check_valid_limits_and_overflow() {
+        let group = |threads| super::group_size(super::ComputeIo { rsrc2: 0, threads });
+        assert_eq!(group([3, 11, 3]).unwrap(), 99);
+        assert_eq!(group([4, 4, 64]).unwrap(), 1024);
+        for dims in [[0, 1, 1], [1025, 1, 1], [1, 1, 65], [u32::MAX, 2, 1]] {
+            assert!(group(dims).is_err(), "invalid dimensions {dims:?}");
+        }
+    }
+}
