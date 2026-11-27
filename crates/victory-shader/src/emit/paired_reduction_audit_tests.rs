@@ -155,7 +155,7 @@ fn warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
 fn oracle(threads: u32, thread: u32, distinct: bool) -> [u32; 2] {
     let base = thread / 64 * 64;
     let end = (base + 64).min(threads);
-    let rounds = |t: u32| (t % 64 & 3) + 1 + if distinct { t / 64 } else { 0 };
+    let rounds = |t: u32| ((t % 64) & 3) + 1 + if distinct { t / 64 } else { 0 };
     let n = rounds(thread);
     let sum = (1..=n)
         .map(|round| (base..end).filter(|&t| rounds(t) >= round).count() as u32)

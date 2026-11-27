@@ -703,7 +703,7 @@ fn oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
             [20, 36][(wave & 1) as usize]
         }),
         wave_total(if threads > 64 { wave ^ 1 } else { wave }),
-        lane_sum(lane ^ if threads % 64 != 0 { 8 } else { 32 }),
+        lane_sum(lane ^ if !threads.is_multiple_of(64) { 8 } else { 32 }),
         thread,
     ]
 }
