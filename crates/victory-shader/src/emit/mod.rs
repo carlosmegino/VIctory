@@ -2995,3 +2995,6 @@ mod barycentric_tests {
         validate(&shader);
     }
 }
+
+#[cfg(all(test, windows))]
+mod paired_reduction_audit_tests;
