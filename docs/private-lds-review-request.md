@@ -1,5 +1,11 @@
 # Independent review requested: wave-private LDS promotion
 
+**Archived at the user's request.** Implementation/evidence source
+03be2d04130d62ea91997933e59d8ca6bfafe1ff is preserved. Do not generalize,
+enable or benchmark this optimization further without independent review
+or a demonstrated real application. The review request remains open; no
+such review or real accepted program is being claimed.
+
 **New result:** [the official #2633 comparison](private-lds-halves-result.md)
 shows that original96 already passes upstream, while the promoted form has
 192 incorrect counter values and more emitted barriers. Do not enable this
