@@ -1154,7 +1154,7 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
 /// lane 40 supplies the first wave's scalar; the partial second wave has empty EXEC
 /// and reads lane 0. No LDS, loop or group barrier is needed to expose the fallback.
 #[test]
-fn masked_first_lane_preserves_the_paired_refusal_for_a_partial_group() {
+fn masked_first_lane_admits_a_proven_partial_group() {
     let mut words = vec![
         vop2(0x1B, 1, k(63), 0), // v1: logical lane index
         vop2(0x25, 2, k(11), 1), // v2: lane + nonzero seed
@@ -1177,15 +1177,9 @@ fn masked_first_lane_preserves_the_paired_refusal_for_a_partial_group() {
         lower::TEST_HOST_WAVE.set(was);
         result
     };
-    let result = translate(96, true, 32);
-    assert!(
-        matches!(result, Err(ShaderError::Unsupported { what, .. })
-            if what == "paired lanes in a thread group that does not fill its console waves"),
-        "an unsupported paired group must not silently become per-half first-lane reads"
-    );
-    // Full paired groups and a native Wave64 host retain admission.
+    // Include full paired groups and native Wave64 as admission controls.
     for (threads, wave64, host_wave, physical) in
-        [(64, true, 32, 32), (256, true, 32, 128), (96, true, 64, 96)]
+        [(64, true, 32, 32), (96, true, 32, 64), (256, true, 32, 128), (96, true, 64, 96)]
     {
         let shader = translate(threads, wave64, host_wave).unwrap_or_else(|error| {
             panic!("threads={threads}, wave64={wave64}, host={host_wave}: {error}")

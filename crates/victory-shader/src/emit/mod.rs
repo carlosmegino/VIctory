@@ -101,6 +101,7 @@ mod idiom;
 mod link;
 mod lower;
 mod own_bits;
+mod partial_pairs;
 mod rect;
 mod sampler;
 mod shader;
@@ -435,20 +436,25 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
-    // A masked first-lane read can elect a lane in the other half, even
-    // when no instruction uses an explicit lane index. Use the exact paired
-    // form for this case. If it refuses (for example, for a partial group),
-    // retain that refusal: a per-half fallback can validate and create a PSO
-    // while electing a different lane in each half of the console wave.
+    let partial = matches!(native.io, crate::native::StageIo::Cs(cs)
+        if partial_pairs::group_size(cs).is_ok_and(|n| !n.is_multiple_of(64)));
+    // A masked first-lane read can elect a lane in the other half. Partial
+    // groups also need exact election and named-lane access. Preserve the
+    // admission error if paired cannot prove that translation.
     if native.stage == HwStage::Cs
         && native.wave64
         && lower::host_max_wave() == 32
         && pairs_on()
         && p.blocks.iter().enumerate().any(|(b, block)| {
             block.insts.iter().enumerate().any(|(i, inst)| {
-                inst.name() == "v_readfirstlane_b32"
-                    && st.guards[b][i].is_some()
-                    && !inst.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1))
+                match inst.name() {
+                    "v_readfirstlane_b32" => {
+                        (partial || st.guards[b][i].is_some())
+                            && !inst.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1))
+                    }
+                    "v_readlane_b32" | "v_writelane_b32" | "ds_bpermute_b32" => partial,
+                    _ => false,
+                }
             })
         })
     {
@@ -497,17 +503,6 @@ fn pairs_on() -> bool {
 thread_local! {
     /// A test's choice for [`pairs_on`], for its thread only.
     static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
-    // Test binaries only. Production keeps the independent refusal.
-    static TEST_PARTIAL_PAIRS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-fn partial_pairs_experiment() -> bool {
-    #[cfg(test)]
-    {
-        TEST_PARTIAL_PAIRS.get()
-    }
-    #[cfg(not(test))]
-    false
 }
 
 /// [`emit`] in every form but the paired one, with the wave size the result requires of the
@@ -623,7 +618,9 @@ fn emit_forms(
             if pairs_on() {
                 let again = paired(c, native, p, io, res);
                 report("paired lanes, before an approximate form", &again);
-                if again.is_ok() {
+                let partial = matches!(native.io, crate::native::StageIo::Cs(cs)
+                    if partial_pairs::group_size(cs).is_ok_and(|n| !n.is_multiple_of(64)));
+                if again.is_ok() || partial {
                     return again;
                 }
             }
@@ -868,11 +865,10 @@ fn widen(
 /// ([`lower::with_paired_lanes`]): each console wave run by one host wave of 32 lanes, each
 /// thread two of its lanes, with every per-lane branch taken by the whole wave as the console
 /// takes it ([`structure::structure_wide`]), so that a host wave's threads go the same way and
-/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves where
-/// the console's waves reach them; the only barriers added are on entry, before the program,
-/// where a group of several console waves numbers its waves (`Lower::wave_base`). A thread
-/// group whose console waves are not full would need the lanes past its end kept out of every
-/// effect: refused.
+/// EXEC stays each lane's guard. The program's barriers are reached by whole host waves.
+/// The wave-number allocator synchronizes when a group enters the program. For a partial
+/// final wave, `partial_pairs::check` proves admission and lowering keeps absent logical
+/// lanes out of guest effects and lane-set operations.
 /// Descriptors and addresses stay those traced on the lanes' own paths (`res`, as for every
 /// other form): the per-lane form rests on a lane that reads a scalar after a join having
 /// come the way the wave did, and knowing less of a lane's way the wave-wide form would miss
@@ -890,14 +886,10 @@ fn paired(
             what: "paired lanes outside compute",
         });
     };
-    let threads = cs.threads.iter().product::<u32>();
-    if threads % 64 != 0 && !partial_pairs_experiment() {
-        return Err(ShaderError::Unsupported {
-            offset: 0,
-            what: "paired lanes in a thread group that does not fill its console waves",
-        });
-    }
-    if partial_pairs_experiment() && threads % 64 != 0 && threads > 64 && cs.lds_bytes() >= 32768 {
+    let threads = partial_pairs::group_size(cs)?;
+    let partial = !threads.is_multiple_of(64);
+    if partial && (cs.lds_bytes() > partial_pairs::LDS_BYTES
+        || (threads > 64 && cs.lds_bytes() == partial_pairs::LDS_BYTES)) {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "partial paired waves without a private LDS allocation counter",
@@ -919,6 +911,9 @@ fn paired(
         }
         wide.extend(lanes);
     };
+    if partial {
+        partial_pairs::check(native, p, &st, res, threads)?;
+    }
     lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
 }
 

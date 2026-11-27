@@ -1096,9 +1096,9 @@ impl<'a> Lower<'a> {
         let mut halves: Option<u32> = None;
         let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
         let partial_threads = match x.native.io {
-            StageIo::Cs(cs) if paired && super::partial_pairs_experiment() => {
+            StageIo::Cs(cs) if paired => {
                 let threads = cs.threads.iter().product::<u32>();
-                (threads % 64 != 0).then_some(threads)
+                (!threads.is_multiple_of(64)).then_some(threads)
             }
             _ => None,
         };
@@ -3728,7 +3728,13 @@ impl<'a> Lower<'a> {
         let k = self.s.m.i32(slot);
         let ptr = self.s.m.element(e, lds, k);
         let zero = self.s.m.i32(0);
-        self.s.m.store(e, ptr, zero);
+        if self.partial_threads.is_some() {
+            // The private counter is initially undefined. Concurrent atomic
+            // initializers all set it to zero before the first rendezvous.
+            self.s.m.atomic(e, Rmw::And, ptr, zero);
+        } else {
+            self.s.m.store(e, ptr, zero);
+        }
         self.group_sync(e);
         let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
         let first = self.s.m.cmp(e, pred::EQ, lane, zero);
@@ -4594,16 +4600,33 @@ impl<'a> Lower<'a> {
             return Err("LDS the program does not allocate");
         }
         let a = self.vgprs(inst, addr.as_ref().ok_or("an LDS address")?, 1)?[0];
+        // The partial backend reserves LDS past the guest allocation. Check
+        // the guest's range before computing a pointer into the host array.
+        let guest_dwords = self.partial_threads.and_then(|_| match self.x.native.io {
+            StageIo::Cs(cs) => Some(cs.lds_bytes() / 4),
+            _ => None,
+        });
         // shortcut: LDS addresses are taken as dword-aligned and in bounds
         // (out-of-bounds console accesses read 0 and drop writes).
-        let dword = |l: &mut Self, bytes: u32| -> V {
+        let dword = |l: &mut Self, bytes: u32| -> (V, Option<V>) {
             let c = l.cur;
             let o = l.s.m.i32(bytes);
             let at = l.s.m.bin(c, Bin::Add, a, o);
             let two = l.s.m.i32(2);
-            let index = l.s.m.bin(c, Bin::LShr, at, two);
+            let mut index = l.s.m.bin(c, Bin::LShr, at, two);
+            let mut access = guard;
+            if let Some(dwords) = guest_dwords {
+                let end = l.s.m.i32(dwords);
+                let in_bounds = l.s.m.cmp(c, pred::IULT, index, end);
+                let zero = l.s.m.i32(0);
+                index = l.s.m.select(c, in_bounds, index, zero);
+                access = Some(match guard {
+                    Some(g) => l.s.m.bin(c, Bin::And, g, in_bounds),
+                    None => in_bounds,
+                });
+            }
             let lds = l.s.lds();
-            l.s.m.element(c, lds, index)
+            (l.s.m.element(c, lds, index), access)
         };
         let width = |n: &str| match n.rsplit('_').next() {
             Some("b64") => 2,
@@ -4637,7 +4660,7 @@ impl<'a> Lower<'a> {
                 || name.ends_with("_d16_hi")
         });
         if let Some(bits) = sub {
-            let p = dword(self, offset);
+            let (p, access) = dword(self, offset);
             let o = self.s.m.i32(offset);
             let at = self.s.m.bin(c, Bin::Add, a, o);
             let three = self.s.m.i32(3);
@@ -4646,7 +4669,7 @@ impl<'a> Lower<'a> {
             let mask = self.s.m.i32((1u32 << bits) - 1);
             if name.starts_with("ds_read") {
                 let reg = dst_reg.ok_or("an LDS read result")?;
-                let w = self.load_guest_lds(p, guard);
+                let w = self.load_guest_lds(p, access);
                 let c = self.cur;
                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
                 let x = if base.contains("_i") {
@@ -4690,7 +4713,7 @@ impl<'a> Lower<'a> {
                 let ones = self.s.m.i32(u32::MAX);
                 let keep = self.s.m.bin(c, Bin::Xor, m, ones);
                 use super::bitcode::Rmw;
-                let at = self.begin_guarded(guard);
+                let at = self.begin_guarded(access);
                 self.s.m.atomic(self.cur, Rmw::And, p, keep);
                 self.s.m.atomic(self.cur, Rmw::Or, p, x);
                 self.end_guarded(at, &[]);
@@ -4709,8 +4732,8 @@ impl<'a> Lower<'a> {
             let mut n = 0;
             for (off, w) in elements {
                 for k in 0..w {
-                    let p = dword(self, off + 4 * k);
-                    let x = self.load_guest_lds(p, guard);
+                    let (p, access) = dword(self, off + 4 * k);
+                    let x = self.load_guest_lds(p, access);
                     self.write(inst, Reg::V(reg + n), x, guard);
                     n += 1;
                 }
@@ -4732,9 +4755,19 @@ impl<'a> Lower<'a> {
                     stores.push((off + 4 * k as u32, x));
                 }
             }
+            // Partial admission currently accepts single-dword LDS stores.
+            if guest_dwords.is_some() {
+                for (off, x) in stores {
+                    let (p, access) = dword(self, off);
+                    let at = self.begin_guarded(access);
+                    self.s.m.store(self.cur, p, x);
+                    self.end_guarded(at, &[]);
+                }
+                return Ok(());
+            }
             let at = self.begin_guarded(guard);
             for (off, x) in stores {
-                let p = dword(self, off);
+                let (p, _) = dword(self, off);
                 self.s.m.store(self.cur, p, x);
             }
             self.end_guarded(at, &[]);
@@ -4770,13 +4803,13 @@ impl<'a> Lower<'a> {
             Some((_, v)) => self.i32_of(v).unwrap_or(self.s.m.i32(0)),
             None => self.s.m.i32(0),
         };
-        let p = dword(self, offset);
+        let (p, access) = dword(self, offset);
         if let Some(max) = match op.as_str() {
             "max_f32" => Some(true),
             "min_f32" => Some(false),
             _ => None,
         } {
-            let at = self.begin_guarded(guard);
+            let at = self.begin_guarded(access);
             let r = self.lds_float_min_max(p, v0, max);
             let r = self.end_guarded(at, &[(r, outside)])[0];
             if let Some(reg) = dst_reg {
@@ -4784,7 +4817,7 @@ impl<'a> Lower<'a> {
             }
             return Ok(());
         }
-        let at = self.begin_guarded(guard);
+        let at = self.begin_guarded(access);
         // A subtraction of a value that is no constant, as `ds_add` of its negation (HLSL's
         // `InterlockedAdd(shared, -x)`) or as `ds_sub`, is a compare-exchange loop: NVIDIA's
         // compiler refuses `atomicrmw add` of `0 - x` and `atomicrmw sub` on group-shared
@@ -7573,7 +7606,13 @@ impl<'a> Lower<'a> {
                 };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                if self.partial_threads.is_some() {
+                    // Partial admission proves the named lane exists in every
+                    // wave. WRITELANE ignores EXEC, as does READLANE.
+                    self.write_i(inst, r, None)
+                } else {
+                    int(self, r)
+                }
             }
             "v_readfirstlane_b32"
                 if inst
@@ -10097,6 +10136,9 @@ impl<'a> Lower<'a> {
             index = None;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if self.partial_threads.is_some() {
+                return Err("partial paired lanes with a vector constant-buffer read");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -10348,6 +10390,28 @@ impl<'a> Lower<'a> {
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
+            return Ok(());
+        }
+        if self.partial_threads.is_some() {
+            // Admission permits an untyped, unindexed dword load with a
+            // statically traced table descriptor. The access itself, not
+            // just its result, follows the lane predicate.
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let mask = self.s.m.i8(1);
+            let align = self.s.m.i32(4);
+            let at = self.begin_guarded(guard);
+            let r = self.s.op(
+                self.cur, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret, 139,
+                &[h, off, iu, mask, align],
+            );
+            let x = self.s.m.extract(self.cur, r, 0);
+            let x = self.as_int(x);
+            let zero = self.s.m.i32(0);
+            let x = self.end_guarded(at, &[(x, zero)])[0];
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         let r = if typed {

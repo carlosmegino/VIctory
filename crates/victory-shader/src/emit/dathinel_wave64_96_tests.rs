@@ -257,10 +257,20 @@ fn debug_warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
 }
 
 fn run(threads: u32) {
-    run_case([threads, 1, 1], false, false);
+    run_case([threads, 1, 1], false);
 }
 
-fn run_case(dims: [u32; 3], experiment: bool, matrix: bool) {
+fn run_case(dims: [u32; 3], matrix: bool) {
+    let expected = if matrix { matrix_oracle } else { oracle };
+    run_guest(dims, guest(dims, matrix), expected, false);
+}
+
+fn run_guest(
+    dims: [u32; 3],
+    native: NativeProgram,
+    expected: fn(u32, u32) -> [u32; OUTPUTS],
+    check_atomic: bool,
+) {
     let threads = dims.into_iter().product::<u32>();
     static DEBUG: std::sync::Once = std::sync::Once::new();
     // SAFETY: These opt-in tests run in isolation and enable the debug layer
@@ -294,11 +304,8 @@ fn run_case(dims: [u32; 3], experiment: bool, matrix: bool) {
     // Use the same host capability as the runtime and enter through the
     // public translator. Neither the paired form nor a wave override is used.
     super::set_host_max_wave(caps.WaveLaneCountMax);
-    let bytes = crate::native::tests::compute_uav_container(&guest(dims, matrix));
-    let restore = super::TEST_PARTIAL_PAIRS.replace(experiment);
-    let translated = super::translate(&bytes);
-    super::TEST_PARTIAL_PAIRS.set(restore);
-    let mut shader = translated.expect("translate synthetic wave64 container");
+    let bytes = crate::native::tests::compute_uav_container(&native);
+    let mut shader = super::translate(&bytes).expect("translate synthetic wave64 container");
     validator::Validator::load(validator::Validator::default_path().as_deref())
         .expect("DXIL validator")
         .validate(&mut shader.dxil)
@@ -318,7 +325,12 @@ fn run_case(dims: [u32; 3], experiment: bool, matrix: bool) {
         u32_at(psv.data, 20).unwrap(),
         u32_at(psv.data, 24).unwrap()
     );
-    let views = [(); OUTPUTS].map(|()| View::RawUav(threads + GUARD as u32));
+    let mut views: Vec<_> = (0..OUTPUTS)
+        .map(|_| View::RawUav(threads + GUARD as u32))
+        .collect();
+    if check_atomic {
+        views.push(View::RawUav(1));
+    }
     let data = vec![0; shader.user_data_dwords().max(1) as usize];
     let out = host
         .dispatch(
@@ -334,10 +346,16 @@ fn run_case(dims: [u32; 3], experiment: bool, matrix: bool) {
         .expect("dispatch and readback");
     let warnings = debug_warnings(&queue);
     assert!(warnings.is_empty(), "D3D12 validation: {warnings:#?}");
-    assert_eq!(out.len(), OUTPUTS);
-    let expected = if matrix { matrix_oracle } else { oracle };
+    assert_eq!(out.len(), views.len());
+    if check_atomic {
+        assert_eq!(
+            out[OUTPUTS],
+            [threads],
+            "one buffer atomic per present lane"
+        );
+    }
     let mut failures = 0;
-    for (slot, words) in out.iter().enumerate() {
+    for (slot, words) in out.iter().take(OUTPUTS).enumerate() {
         assert_eq!(words.len(), threads as usize + GUARD);
         let mut count = 0;
         for thread in 0..threads {
@@ -411,34 +429,154 @@ fn wave64_missing_half_96() {
 #[test]
 #[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
 fn paired_partial_96_oracle() {
-    run_case([96, 1, 1], true, false);
+    run_case([96, 1, 1], false);
 }
 
 #[test]
 #[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
 fn paired_partial_size_matrix() {
     for threads in [1, 31, 32, 33, 63, 65, 95, 97, 127, 129, 1023] {
-        run_case([threads, 1, 1], true, true);
+        run_case([threads, 1, 1], true);
     }
 }
 
 #[test]
 #[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
 fn paired_partial_3d_group() {
-    run_case([3, 11, 3], true, true);
+    run_case([3, 11, 3], true);
 }
 
-// The paired backend deliberately has no partial-group execution yet.
+fn memory_and_exec_guest() -> (NativeProgram, Vec<u32>) {
+    let mut native = guest([97, 1, 1], true);
+    let mut counter = native.used[0];
+    counter.table_offset_dwords = OUTPUTS as u32 * 8;
+    counter.lower_bound = OUTPUTS as u32;
+    native.used.push(counter);
+    let mut words = vec![
+        alu(0x1B, 2, k(63), 0), // logical lane
+        alu(0x25, 4, k(11), 2), // nonzero source
+        sop1(4, 22, EXEC),
+        sop1(4, EXEC, k(0)),
+        0x7E00_0400 | 6 << 17 | v(4), // first lane with EXEC empty
+        0xD761_0004,                  // writelane v4, 42, lane 1, ignores EXEC
+        k(42) | (k(1) << 9),
+        0xD760_0007, // readlane s7, v4, 1, ignores EXEC
+        v(4) | (k(1) << 9),
+        sop1(4, EXEC, 22),
+        mov(10, 6),
+        mov(11, 7),
+        mov(6, k(63)), // sentinel for lanes left out by direct EXEC = 3
+        mov(14, k(4)), // source lane one
+        sop1(4, EXEC, k(3)),
+    ];
+    words.extend(ds(0xB3, 6, 14, 4));
+    words.extend([
+        sop1(4, EXEC, 22),
+        alu(0x1D, 14, k(32), 2),
+        alu(0x1A, 14, k(2), 14),
+    ]);
+    words.extend(ds(0xB3, 9, 14, 4)); // opposite logical half or zero
+    words.extend([
+        mov(14, 255),
+        1024, // first byte beyond guest LDS, the private counter slot
+    ]);
+    words.extend(ds(0x0D, 0, 14, 4)); // guest out-of-bounds store is dropped
+    words.extend(ds(0x36, 12, 14, 0)); // guest out-of-bounds read yields zero
+    words.extend([
+        0xBE85_0380,
+        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+        (125 << 25) | (OUTPUTS as u32 * 32),
+        0xBF8C_C07F,
+        mov(13, k(1)),
+        0xE0C8_0000,
+        0x8002_0D00, // buffer_atomic_add at byte zero, no return
+        0xBF8C_0F70, // wait before the inter-wave rendezvous
+        0xBF8A_0000,
+        0xE030_0000,
+        0x8002_0700, // buffer_load_dword v7 at byte zero
+        0xBF8C_0F70,
+        alu(0x1A, 15, k(2), 0),
+    ]);
+    for (slot, reg) in [10, 11, 6, 9, 12, 7, 0].into_iter().enumerate() {
+        words.extend([
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25 | (slot as u32 * 32),
+            0xBF8C_C07F,
+            0xE070_1000,
+            0x8002_0000 | reg << 8 | 15,
+        ]);
+    }
+    words.push(0xBF81_0000);
+    (native, words)
+}
+
+fn memory_and_exec_oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
+    let (wave, lane) = (thread / 64, thread % 64);
+    let source = lane ^ 32;
+    [
+        11,
+        42,
+        if lane < 2 { 42 } else { 63 },
+        if wave * 64 + source < threads {
+            if source == 1 { 42 } else { 11 + source }
+        } else {
+            0
+        },
+        0,
+        threads,
+        thread,
+    ]
+}
+
 #[test]
-fn wave64_partial_group_refusal_96() {
+#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+fn paired_partial_direct_exec_and_memory() {
+    let (mut native, words) = memory_and_exec_guest();
+    native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    run_guest([97, 1, 1], native, memory_and_exec_oracle, true);
+}
+
+#[test]
+fn wave64_partial_group_rejects_unproven_effects() {
+    let (native, words) = memory_and_exec_guest();
+    let translate = |mut native: NativeProgram, words: Vec<u32>| {
+        native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let was = super::lower::TEST_HOST_WAVE.replace(Some(32));
+        let pairs = super::TEST_PAIRS.replace(Some(true));
+        let result = super::translate(&crate::native::tests::compute_uav_container(&native));
+        super::TEST_PAIRS.set(pairs);
+        super::lower::TEST_HOST_WAVE.set(was);
+        result.err().map(|e| e.to_string())
+    };
+    let mut raw = words.clone();
+    raw[3] = sop1(4, EXEC, 193); // -1 enables nonexistent logical lanes
+    assert!(
+        translate(native.clone(), raw).is_some_and(|e| e.contains("bits outside the guest group"))
+    );
+    let mut lane = words.clone();
+    let readlane = lane.iter().position(|&word| word == 0xD760_0007).unwrap();
+    lane[readlane + 1] = v(4) | (k(33) << 9); // source is absent in the final 33-lane wave
+    assert!(translate(native.clone(), lane).is_some_and(|e| e.contains("not certified")));
+    let mut barrier = words.clone();
+    let at = barrier.iter().position(|&w| w == 0xBF8A_0000).unwrap();
+    barrier.splice(at..at, [cmp(0xD1, k(32), 2), 0xBF88_0001]);
+    assert!(translate(native, barrier).is_some_and(|e| e.contains("no proven group rendezvous")));
+}
+
+#[test]
+fn wave64_partial_group_refuses_full_lds_without_allocator_space() {
     let was = super::lower::TEST_HOST_WAVE.replace(Some(32));
     let pairs = super::TEST_PAIRS.replace(Some(true));
-    let bytes = crate::native::tests::compute_uav_container(&guest([96, 1, 1], false));
+    let mut native = guest([96, 1, 1], false);
+    if let StageIo::Cs(ref mut cs) = native.io {
+        cs.rsrc2 = (cs.rsrc2 & !(0x1ff << 15)) | (64 << 15);
+    }
+    let bytes = crate::native::tests::compute_uav_container(&native);
     let result = super::translate(&bytes);
     super::TEST_PAIRS.set(pairs);
     super::lower::TEST_HOST_WAVE.set(was);
     assert!(
         matches!(result, Err(crate::ShaderError::Unsupported { what, .. })
-        if what == "paired lanes in a thread group that does not fill its console waves")
+        if what == "partial paired waves without a private LDS allocation counter")
     );
 }
