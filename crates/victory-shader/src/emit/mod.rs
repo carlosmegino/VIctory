@@ -1845,3 +1845,8 @@ mod tests {
         let _ = super::emit(&c, &native, &p, &st, &io, &res);
     }
 }
+
+#[cfg(all(test, windows))]
+mod paired_repro_contract_tests;
+#[cfg(all(test, windows))]
+mod paired_repro_consumer_tests;
