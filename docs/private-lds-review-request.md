@@ -1,5 +1,10 @@
 # Independent review requested: wave-private LDS promotion
 
+**New result:** [the official #2633 comparison](private-lds-halves-result.md)
+shows that original96 already passes upstream, while the promoted form has
+192 incorrect counter values and more emitted barriers. Do not enable this
+pass on halves. A synthetic repro and test-only installer are included.
+
 This branch publishes an explicit compiler prototype for review, not an
 enabled optimization or an integration proposal for an entire paired backend.
 The analysis/rewrite is now in crates/victory-shader/src/private_lds.rs,
