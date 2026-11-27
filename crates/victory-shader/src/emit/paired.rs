@@ -12,6 +12,34 @@ pub(in super::super) fn supports_paired_lds(name: &str) -> bool {
 }
 
 impl<'a> Lower<'a> {
+    pub(super) fn static_paired_threads(&self) -> Option<u32> {
+        self.twin.as_ref()?;
+        let StageIo::Cs(cs) = self.x.native.io else { return None };
+        let threads = cs.threads.into_iter().product::<u32>();
+        (!threads.is_multiple_of(64)).then_some(threads)
+    }
+
+    pub(super) fn static_paired_prologue(&mut self) -> Result<(), Why> {
+        if let Some(threads) = self.static_paired_threads() {
+            let [lo, hi] = self.both(|l| {
+                let id = l.console_thread();
+                let end = l.s.m.i32(threads);
+                Ok(l.s.m.cmp(l.s.entry, pred::IULT, id, end))
+            })?;
+            self.partial_active = Some(lo);
+            self.twin.as_deref_mut().expect("paired form").partial_active = Some(hi);
+        }
+        Ok(())
+    }
+
+    fn paired_source_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
+        if self.static_paired_threads().is_some() {
+            self.effect_guard(b, i)
+        } else {
+            self.guard(b, i)
+        }
+    }
+
     pub(super) fn paired_lds(&mut self, inst: &Inst, address: V, guard: Option<V>, dwords: u32) -> Result<(), Why> {
         let Fields::Ds { dst, data, offset0, offset1, .. } = &inst.fields else {
             return Err("a paired LDS operation");
@@ -51,6 +79,12 @@ impl<'a> Lower<'a> {
             let index = self.s.m.bin(c, Bin::LShr, at, two);
             let bound = self.s.m.i32(dwords);
             let inside = self.s.m.cmp(c, pred::IULT, index, bound);
+            let inside = if self.static_paired_threads().is_some() && offset != 0 {
+                let no_wrap = self.s.m.cmp(c, pred::IUGE, at, address);
+                self.s.m.bin(c, Bin::And, inside, no_wrap)
+            } else {
+                inside
+            };
             let on = guard.map_or(inside, |g| self.s.m.bin(c, Bin::And, g, inside));
             let join = self.begin_guarded(Some(on));
             let lds = self.s.lds();
@@ -220,7 +254,7 @@ impl<'a> Lower<'a> {
             "v_readfirstlane_b32" => {
                 let [(lo, in_lo), (hi, in_hi)] = self.both(|l| {
                     let x = l.src(inst, 0)?;
-                    let guard = l.guard(b, i)?;
+                    let guard = l.paired_source_guard(b, i)?;
                     Ok(l.first_lane(x, guard))
                 })?;
                 // the first lane in EXEC is a lower one if there is one; with none, lane 0
@@ -247,7 +281,7 @@ impl<'a> Lower<'a> {
                 let [(from_lo, x_lo, g_lo), (from_hi, x_hi, g_hi)] = self.both(|l| {
                     let at = l.vgprs(inst, addr, 1)?[0];
                     let x = l.vgprs(inst, data, 1)?[0];
-                    let guard = l.guard(b, i)?;
+                    let guard = l.paired_source_guard(b, i)?;
                     let (o, two) = (l.s.m.i32(offset), l.s.m.i32(2));
                     let at = l.s.m.bin(c, Bin::Add, at, o);
                     let from = l.s.m.bin(c, Bin::LShr, at, two);

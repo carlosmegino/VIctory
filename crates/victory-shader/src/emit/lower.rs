@@ -922,7 +922,7 @@ impl<'a> Lower<'a> {
         if let StageIo::Cs(cs) = x.native.io
             && paired
         {
-            let waves = cs.threads.iter().product::<u32>() / 64;
+            let waves = cs.threads.iter().product::<u32>().div_ceil(64);
             s.threads = Some([32 * waves, 1, 1]);
             s.lds_dwords = cs.lds_bytes() / 4;
             if waves > 1 {
@@ -1933,6 +1933,7 @@ impl<'a> Lower<'a> {
             self.swap_lanes();
             r?;
         }
+        self.static_paired_prologue().map_err(|w| unsupported(0, w))?;
         // A compute program that reads its group id x may run spread across
         // z (`USER_DISPATCH_SPREAD`). Not a spilled one (the builder's
         // stages, near the root signature's 64 dwords), nor one whose first
@@ -3638,7 +3639,7 @@ impl<'a> Lower<'a> {
         let StageIo::Cs(cs) = self.x.native.io else {
             return;
         };
-        if self.s.mesh.is_some() || !lds_init_hoist_on() {
+        if self.s.mesh.is_some() || self.static_paired_threads().is_some() || !lds_init_hoist_on() {
             return;
         }
         let inits = lds_init_hoists(self.x.p, cs.lds_bytes() / 4);
@@ -7509,7 +7510,12 @@ impl<'a> Lower<'a> {
                 };
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
-                int(self, r)
+                if self.static_paired_threads().is_some() {
+                    // Admission proved this explicit lane exists. WRITELANE ignores EXEC.
+                    self.write_i(inst, r, None)
+                } else {
+                    int(self, r)
+                }
             }
             "v_readfirstlane_b32"
                 if inst
@@ -10148,6 +10154,9 @@ impl<'a> Lower<'a> {
             index = None;
         }
         if used.is_some_and(|u| u.kind == ResourceType::Cbv) && !typed {
+            if self.static_paired_threads().is_some() {
+                return Err("a vector constant-buffer load in a static partial paired group");
+            }
             // A constant buffer read per lane (a dynamically indexed array).
             // shortcut: the console's CBV descriptor is taken to have a 16-byte
             // stride, as the vector loads of whole rows suggest.
@@ -10415,6 +10424,25 @@ impl<'a> Lower<'a> {
             for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
+            return Ok(());
+        }
+        if self.static_paired_threads().is_some() {
+            // Static admission allows only unindexed, untyped dword loads
+            // with a uniform descriptor. Guard the access itself.
+            let h = self.handle(site, src, false, (11 | u, 0))?;
+            let mask = self.s.m.i8(1);
+            let align = self.s.m.i32(4);
+            let at = self.begin_guarded(guard);
+            let r = self.s.op(self.cur, "rawBufferLoad.f32", Attr::ReadOnly, self.s.t.res_ret,
+                139, &[h, off, iu, mask, align]);
+            let x = self.s.m.extract(self.cur, r, 0);
+            let x = self.as_int(x);
+            let zero = self.s.m.i32(0);
+            let x = self.end_guarded(at, &[(x, zero)])[0];
+            let Some(Operand::Vector { reg, .. }) = *data else {
+                return Err("a buffer result");
+            };
+            self.write(inst, Reg::V(reg), x, guard);
             return Ok(());
         }
         let r = if typed {

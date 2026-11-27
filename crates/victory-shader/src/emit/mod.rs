@@ -94,6 +94,9 @@ mod idiom;
 mod link;
 mod lower;
 mod own_bits;
+mod partial_pairs;
+#[cfg(all(test, windows))]
+mod partial_pairs_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -485,6 +488,56 @@ fn emit_any(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
+    let partial = native.wave64
+        && lower::host_max_wave() == 32
+        && matches!(native.io, crate::native::StageIo::Cs(cs)
+            if partial_pairs::group_size(cs).is_ok_and(|n| !n.is_multiple_of(64)));
+    let try_partial = || {
+        lower::take_needs();
+        match paired_impl(c, native, p, true) {
+            Ok((shader, Some(32))) => Some(shader),
+            _ => None,
+        }
+    };
+    let listed = partial && WAVE_PAIRS_HERE.get();
+    if listed && let Some(shader) = try_partial() {
+        eprintln!("WAVE64-PAIRS-ONLY translated with static partial paired Wave64");
+        return Ok(shader);
+    }
+    // This is a rescue path. In particular, a rejection by static paired
+    // admission must not replace a translation the old selector could run.
+    let previous = emit_legacy(c, native, p, st, io, res);
+    if partial
+        && !listed
+        && wave_pairs_on()
+        && needs_a_wave32_form(&previous)
+        && let Some(shader) = try_partial()
+    {
+        return Ok(shader);
+    }
+    previous
+}
+
+fn needs_a_wave32_form(previous: &Result<HostShader, ShaderError>) -> bool {
+    match previous {
+        // `translate` still has its existing retry for this diagnostic.
+        Err(ShaderError::Unsupported { what, .. }) => *what != lower::FIRST_HALF,
+        Ok(shader) => Container::parse(&shader.dxil)
+            .ok()
+            .and_then(|c| crate::dxbc::u32_at(c.part(FourCC::PSV0)?.data, 20).ok())
+            .is_some_and(|min| min > 32 && min <= 64),
+        Err(_) => false,
+    }
+}
+
+fn emit_legacy(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
     // A pixel program that waits for the pixels it overlaps (POPS): the host orders its views
     // instead (`Shader::ordered`), and the program goes past the wait.
     if native.stage == HwStage::Ps
@@ -493,7 +546,7 @@ fn emit_any(
         let st = structure::structure(&q)?;
         let io = io::raise(&q, native)?;
         let res = resource::track(&q, &native.layout, native.stage, Some(&st))?;
-        return emit_any(c, native, &q, &st, &io, &res);
+        return emit_legacy(c, native, &q, &st, &io, &res);
     }
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -937,6 +990,15 @@ fn paired(
     native: &NativeProgram,
     p: &ir::Program,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    paired_impl(c, native, p, false)
+}
+
+fn paired_impl(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    allow_partial: bool,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let crate::native::StageIo::Cs(cs) = native.io else {
         return Err(ShaderError::Unsupported {
             offset: 0,
@@ -954,8 +1016,9 @@ fn paired(
             what: "paired Wave64 for spilled DispatchX programs turned off (VICTORY_WAVE_PAIRS_SPILLED=0)",
         });
     }
-    let threads = cs.threads.iter().product::<u32>();
-    if threads == 0 || threads > 1024 || threads % 64 != 0 {
+    let threads = partial_pairs::group_size(cs)?;
+    let partial = !threads.is_multiple_of(64);
+    if partial && (!allow_partial || crate::spill::is_spilled(native)) {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired lanes in a thread group that does not fill its console waves",
@@ -968,7 +1031,7 @@ fn paired(
         });
     }
     let lds = cs.lds_bytes();
-    if lds + 4 * u32::from(threads > 64) > 32 * 1024 {
+    if lds + 4 * u32::from(threads > 64) > partial_pairs::LDS_BYTES {
         return Err(ShaderError::Unsupported {
             offset: 0,
             what: "paired Wave64 exceeds the compute group shared-memory limit",
@@ -988,7 +1051,7 @@ fn paired(
     }
     let waits = accesses_lds || insts().any(|i| i.name() == "s_barrier");
     // Independently progressing waves cannot rendezvous after a divergent exit.
-    if (threads > 64 && p.blocks.len() > 1 && waits)
+    if (!partial && threads > 64 && p.blocks.len() > 1 && waits)
         || (group_sync() == 0 && (threads > 64 || waits))
     {
         return Err(ShaderError::Unsupported {
@@ -1014,6 +1077,9 @@ fn paired(
     };
     let io = io::raise(p, native)?;
     let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    if partial {
+        partial_pairs::check(native, p, &st, &res, threads)?;
+    }
     lower::with_paired_lanes(|| emit_program(c, native, p, &st, &io, &res))
 }
 
