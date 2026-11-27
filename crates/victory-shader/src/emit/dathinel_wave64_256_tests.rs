@@ -191,6 +191,12 @@ fn debug_warnings(queue: &ID3D12InfoQueue) -> Vec<String> {
 }
 
 fn run(threads: u32) {
+    run_case(threads, false);
+}
+
+// Complementary paired-only check: empty EXEC must read initialized lane zero.
+// The original Dathinel guest/oracle above remain the reference for normal runs.
+fn run_case(threads: u32, empty_exec: bool) {
     static DEBUG: std::sync::Once = std::sync::Once::new();
     // SAFETY: These opt-in tests run in isolation and enable the debug layer
     // before creating the first device in the test process.
@@ -223,7 +229,30 @@ fn run(threads: u32) {
     // Use the same host capability as the runtime and enter through the
     // public translator. Neither the paired form nor a wave override is used.
     super::set_host_max_wave(caps.WaveLaneCountMax);
-    let bytes = crate::native::tests::compute_uav_container(&guest(threads));
+    let mut native = guest(threads);
+    if empty_exec {
+        let mut words: Vec<_> = native
+            .code
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|w| u32::from_le_bytes(*w))
+            .collect();
+        let mut seeded = 0;
+        let mut elections = 0;
+        for word in &mut words {
+            if *word == mov(4, k(0)) {
+                *word = mov(4, k(11));
+                seeded += 1;
+            } else if *word == cmp(0xD1, v(14), 2) {
+                *word = cmp(0xD1, k(63), 2); // No logical lane is greater than 63.
+                elections += 1;
+            }
+        }
+        assert_eq!((seeded, elections), (1, 2));
+        native.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    }
+    let bytes = crate::native::tests::compute_uav_container(&native);
     let mut shader = super::translate(&bytes).expect("translate synthetic wave64 container");
     validator::Validator::load(validator::Validator::default_path().as_deref())
         .expect("DXIL validator")
@@ -264,9 +293,15 @@ fn run(threads: u32) {
     for (slot, words) in out.iter().enumerate() {
         assert_eq!(words.len(), threads as usize + GUARD);
         for thread in 0..threads {
+            let mut expected = oracle(threads, thread);
+            if empty_exec {
+                expected[0] += 11; // Initialized VGPR accumulation.
+                expected[2] = 11; // Both scalar elections read logical lane zero.
+                expected[3] = 11;
+                expected[5] += 11; // LDS holds those initialized lane values.
+            }
             assert_eq!(
-                words[thread as usize],
-                oracle(threads, thread)[slot],
+                words[thread as usize], expected[slot],
                 "UAV {slot}, thread {thread}"
             );
         }
@@ -282,7 +317,7 @@ fn run(threads: u32) {
         "paired metadata: one physical Wave32 per logical Wave64, including a partial wave"
     );
     eprintln!(
-        "{threads} guest threads: {OUTPUTS} UAVs match CPU, guards intact, no D3D12 warnings/errors"
+        "{threads} guest threads, empty_exec={empty_exec}: {OUTPUTS} UAVs match CPU, guards intact, no D3D12 warnings/errors"
     );
 }
 
@@ -303,4 +338,10 @@ fn wave64_auto_group_128() {
 #[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
 fn wave64_auto_group_256() {
     run(256);
+}
+
+#[test]
+#[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
+fn wave64_empty_exec_group_256() {
+    run_case(256, true);
 }

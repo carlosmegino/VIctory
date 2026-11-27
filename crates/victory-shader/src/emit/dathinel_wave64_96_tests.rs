@@ -4,6 +4,9 @@
 //! Synthetic two-wave contract for Marvisak/VIctory#2688. The LDS loop
 //! is adapted from PiloteCode's GPL-3.0 fixture in fxceless/victory-fork#854.
 
+// Keep Dathinel's original guest and oracle expressions for comparison.
+#![allow(clippy::manual_is_multiple_of)]
+
 use super::host::{Dispatch, Host, Root, View};
 use super::validator;
 use crate::native::{
@@ -269,17 +272,27 @@ fn run(threads: u32) {
     let warnings = debug_warnings(&queue);
     assert!(warnings.is_empty(), "D3D12 validation: {warnings:#?}");
     assert_eq!(out.len(), OUTPUTS);
+    let mut failures = 0;
     for (slot, words) in out.iter().enumerate() {
         assert_eq!(words.len(), threads as usize + GUARD);
+        let mut count = 0;
         for thread in 0..threads {
-            assert_eq!(
-                words[thread as usize],
-                oracle(threads, thread)[slot],
-                "UAV {slot}, thread {thread}"
-            );
+            let want = oracle(threads, thread)[slot];
+            if words[thread as usize] != want {
+                count += 1;
+            }
         }
+        failures += count;
+        eprintln!(
+            "CHECK: UAV={slot} mismatches={count}/{threads}; t0={} expected={}; t64={} expected={}",
+            words[0],
+            oracle(threads, 0)[slot],
+            words[64],
+            oracle(threads, 64)[slot]
+        );
         assert_eq!(&words[threads as usize..], &[0; GUARD], "UAV {slot} guard");
     }
+    assert_eq!(failures, 0, "all seven UAVs checked; guards intact");
     let container = Container::parse(&shader.dxil).expect("emitted DXIL container");
     let psv = container
         .part(FourCC::PSV0)
@@ -329,4 +342,19 @@ fn wave64_partial_group_112() {
 #[ignore = "requires a wave32 GPU, Graphics Tools, and DXIL validator"]
 fn wave64_missing_half_96() {
     run(96);
+}
+
+// The paired backend deliberately has no partial-group execution yet.
+#[test]
+fn wave64_partial_group_refusal_96() {
+    let was = super::lower::TEST_HOST_WAVE.replace(Some(32));
+    let pairs = super::TEST_PAIRS.replace(Some(true));
+    let bytes = crate::native::tests::compute_uav_container(&guest(96));
+    let result = super::translate(&bytes);
+    super::TEST_PAIRS.set(pairs);
+    super::lower::TEST_HOST_WAVE.set(was);
+    assert!(
+        matches!(result, Err(crate::ShaderError::Unsupported { what, .. })
+        if what == "paired lanes in a thread group that does not fill its console waves")
+    );
 }
