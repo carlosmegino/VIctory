@@ -840,6 +840,20 @@ fn indirect_counter_guest() -> NativeProgram {
     n
 }
 
+#[test]
+fn private_lds_analysis_rejects_an_overlapping_declared_temporary() {
+    let mut n = guest(96);
+    // The pass would allocate v16. A direct machine operand already names it,
+    // despite the inconsistent register count, and a later export observes it.
+    let mut words: Vec<_> = n.code.as_chunks::<4>().0.iter().copied().map(u32::from_le_bytes).collect();
+    words.insert(3, mov(16, k(42)));
+    let store = words.iter_mut().rfind(|w| **w == 0x8002_0000 | 15).unwrap();
+    *store = 0x8002_0000 | 16 << 8 | 15;
+    n.code = words.into_iter().flat_map(u32::to_le_bytes).collect();
+    let p = crate::ir::build(&n.code, true, n.vgprs).unwrap();
+    assert!(super::private_lds::promote(&n, &p).is_err(), "the new temporary must not alias a guest register");
+}
+
 fn indirect_counter_oracle(threads: u32, thread: u32) -> [u32; OUTPUTS] {
     let wave = thread / 64;
     let lane = thread % 64;

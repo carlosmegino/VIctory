@@ -80,6 +80,10 @@ impl State {
             } if matches!(inst.name(), "s_mov_b32" | "s_mov_b64") => {
                 for word in 0..*dwords {
                     let op = match src[0] {
+                        Operand::Scalar {
+                            code: crate::gfx10::NULL,
+                            ..
+                        } => Operand::Literal(0),
                         Operand::Scalar { code, dwords } => Operand::Scalar {
                             code: code + word,
                             dwords,
@@ -316,6 +320,14 @@ pub(super) fn promote(native: &NativeProgram, p: &Program) -> Result<Promotion, 
         .any(|(r, _)| matches!(r, Reg::S(128..)))
     {
         return Err("parked scalar registers need a separate allocation proof");
+    }
+    if p.blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .flat_map(|i| i.reads.iter().chain(&i.writes))
+        .any(|(reg, _)| matches!(reg, Reg::V(r) if u16::from(*r) >= native.vgprs))
+    {
+        return Err("guest vector operand exceeds its declared register allocation");
     }
     let loop_block = &p.blocks[1];
     let additions: Vec<_> = loop_block
@@ -567,4 +579,25 @@ pub(super) fn promote(native: &NativeProgram, p: &Program) -> Result<Promotion, 
         scalar_words: 6,
         vector_words: 1,
     })
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn null_is_zero_for_both_words_of_a_scalar_move() {
+        // NULL is a special source, not the first word of a register pair.
+        // An independent expected value must not come from State::operand.
+        let words = [0xBEA4_047D, 0xBF81_0000]; // s_mov_b64 s[36:37], null
+        let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let p = crate::ir::build(&code, true, 1).unwrap();
+        let mut state = State::new(96);
+        state.step(&p.blocks[0].insts[0]);
+        assert!(state.s[36].iter().all(|v| *v == Some(0)));
+        assert!(
+            state.s[37].iter().all(|v| *v == Some(0)),
+            "NULL's high word must not read EXEC_LO"
+        );
+    }
 }
