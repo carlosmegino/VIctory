@@ -111,6 +111,10 @@ mod waterfall_tests;
 mod wave64_tests;
 #[cfg(all(test, windows))]
 mod wave64_group_tests;
+#[cfg(all(test, windows))]
+mod dathinel_wave64_96_tests;
+#[cfg(all(test, windows))]
+mod dathinel_wave64_256_tests;
 mod wave;
 
 use crate::dxbc::{Container, FourCC};
