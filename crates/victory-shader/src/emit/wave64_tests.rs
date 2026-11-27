@@ -1150,6 +1150,52 @@ fn a_wave_value_used_past_a_lane_branch_takes_the_paired_form_not_an_approximate
     eprintln!("ran on the hardware device: the wave's OR past the branch in every lane, not each half's");
 }
 
+/// Minimized from Dathinel's 96-thread extension (victory-4gb 561503d) of #3180:
+/// lane 40 supplies the first wave's scalar; the partial second wave has empty EXEC
+/// and reads lane 0. No LDS, loop or group barrier is needed to expose the fallback.
+#[test]
+fn masked_first_lane_preserves_the_paired_refusal_for_a_partial_group() {
+    let mut words = vec![
+        vop2(0x1B, 1, k(63), 0), // v1: logical lane index
+        vop2(0x25, 2, k(11), 1), // v2: lane + nonzero seed
+        sop1(0x04, 12, EXEC),    // save EXEC
+        vopc(0xD1, k(39), 1),    // only lanes 40..63
+        vop1(0x02, 6, v(2)),     // v_readfirstlane_b32 s6, v2
+        sop1(0x04, EXEC, 12),    // restore EXEC
+        vop1(0x01, 3, 6),        // broadcast to all lanes
+    ];
+    words.extend(stores([3, 2, 1, 0]));
+    let translate = |threads, wave64, host_wave| {
+        let mut native = native_of(&words, wave64, threads);
+        native.layout.remove(0); // This program has no root constants.
+        native.layout[0].slot = 0;
+        native.used[0].slot = 0;
+        let was = lower::TEST_HOST_WAVE.replace(Some(host_wave));
+        let pairs = super::TEST_PAIRS.replace(Some(true));
+        let result = super::translate(&crate::native::tests::compute_uav_container(&native));
+        super::TEST_PAIRS.set(pairs);
+        lower::TEST_HOST_WAVE.set(was);
+        result
+    };
+    let result = translate(96, true, 32);
+    assert!(
+        matches!(result, Err(ShaderError::Unsupported { what, .. })
+            if what == "paired lanes in a thread group that does not fill its console waves"),
+        "an unsupported paired group must not silently become per-half first-lane reads"
+    );
+    // Full paired groups and a native Wave64 host retain admission.
+    for (threads, wave64, host_wave, physical) in
+        [(64, true, 32, 32), (256, true, 32, 128), (96, true, 64, 96)]
+    {
+        let shader = translate(threads, wave64, host_wave).unwrap_or_else(|error| {
+            panic!("threads={threads}, wave64={wave64}, host={host_wave}: {error}")
+        });
+        let c = crate::Container::parse(&shader.dxil).unwrap();
+        let psv = c.part(crate::FourCC::PSV0).unwrap();
+        assert_eq!(crate::dxbc::u32_at(psv.data, 40).unwrap(), physical);
+    }
+}
+
 /// [`half_sum_program`] in the paired form: each half's tree over its 32 lanes, then the two
 /// halves' sums, the console's last addition.
 #[test]

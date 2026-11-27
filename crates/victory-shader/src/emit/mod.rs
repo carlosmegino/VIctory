@@ -436,8 +436,10 @@ fn emit_any(
     res: &resource::Resources,
 ) -> Result<HostShader, ShaderError> {
     // A masked first-lane read can elect a lane in the other half, even
-    // when no instruction uses an explicit lane index. Try the exact paired
-    // form before accepting a host32 form for this case.
+    // when no instruction uses an explicit lane index. Use the exact paired
+    // form for this case. If it refuses (for example, for a partial group),
+    // retain that refusal: a per-half fallback can validate and create a PSO
+    // while electing a different lane in each half of the console wave.
     if native.stage == HwStage::Cs
         && native.wave64
         && lower::host_max_wave() == 32
@@ -449,9 +451,8 @@ fn emit_any(
                     && !inst.writes.first().is_some_and(|w| res.waterfall.reads.contains(&w.1))
             })
         })
-        && let Ok((shader, _)) = paired(c, native, p, io, res)
     {
-        return Ok(shader);
+        return paired(c, native, p, io, res).map(|(shader, _)| shader);
     }
     let r = emit_forms(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that no form above gives
