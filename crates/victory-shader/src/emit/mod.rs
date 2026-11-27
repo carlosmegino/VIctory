@@ -96,7 +96,7 @@ mod lower;
 mod own_bits;
 mod partial_pairs;
 #[cfg(test)]
-mod private_lds;
+use crate::private_lds;
 #[cfg(all(test, windows))]
 mod partial_pairs_tests;
 mod rect;

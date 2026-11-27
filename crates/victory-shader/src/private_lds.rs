@@ -4,6 +4,10 @@
 //! publication, not just the atomic's address. Unknown values lose precision;
 //! they never become evidence of independence. No guest input is rewritten by
 //! the tests before this analysis runs.
+//!
+//! The analysis and guest rewrite depend only on native/IR definitions, not on
+//! paired lowering. Applying it to another backend still requires validating
+//! that backend's scalar/EXEC semantics and synchronization costs.
 
 use crate::gfx10::{Fields, Operand};
 use crate::ir::{Exit, Inst, Program, Reg};

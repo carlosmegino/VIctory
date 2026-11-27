@@ -14,6 +14,8 @@ pub mod gfx10;
 pub mod io;
 pub mod ir;
 pub mod native;
+#[cfg(test)]
+mod private_lds;
 pub mod resource;
 pub mod spill;
 pub mod structure;
